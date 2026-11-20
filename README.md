@@ -1,8 +1,8 @@
 # nagisafetch
 
-一个零依赖、可换主题的系统信息工具，纯 Python 标准库实现。
+查系统信息的小工具。纯 Python 标准库写的，一个依赖都不用装。
 
-设计借鉴 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 的预设机制：`-c PRESET` 加载布局，检测不到的字段自动跳过，不写死任何发行版或桌面环境。内置 31 个字段、7 套主题、6 个 ASCII logo，支持 kitty 图片 logo 和分组配色。
+布局这套是从 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 那儿学来的，`-c PRESET` 选预设，检测不到的字段直接跳过，不写死某个发行版或桌面环境。31 个字段、7 套主题、6 个 ASCII logo，也能贴一张 PNG 当 logo（走 kitty 图片协议）。
 
 ```
 ✦ hardware
@@ -27,25 +27,25 @@
   Processes:  244
 ```
 
-## 特性
+## 它能干什么
 
-- **零依赖**：只用 Python 3 标准库，不装任何 pip 包
-- **预设机制**（照 fastfetch）：`-c default|minimal|all|sora`，`-c all` 列出全部字段
-- **主题系统**：单色（arch/nord/dracula/gruvbox/kanagawa/rose）+ 分组四色（sora）
-- **自动检测**：不写死发行版/WM，从 `/etc/os-release`、`/proc`、`gsettings`、rice 配置里读
-- **Termux/Android 适配**：自动识别 Termux
-- **kitty 图片 logo**：`--logo-image` 用 kitty graphics 协议直传 PNG
-- **终端宽度自适应**：窄屏自动把 logo 挪到顶部，避免挤压文字
+- 零依赖，Python 3 标准库就够，pip 包一个不用装。
+- 预设照着 fastfetch 做。`-c default|minimal|all|sora`，`-c all` 把所有字段都列出来。
+- 7 套主题。arch、nord、dracula、gruvbox、kanagawa、rose 是单色，sora 是分组四色。
+- 自动检测。发行版、WM 这些从 `/etc/os-release`、`/proc`、`gsettings` 和你自己的 rice 配置里读，读不到就跳过这一项。
+- Termux 上也能跑。它会认出 Termux，IP 用 UDP 法拿，电池从 Binder 读，Android 封掉的 `/proc` 路径绕开。
+- 图片 logo 用 `--logo-image` 传 PNG，走 kitty graphics 协议，SSH 里也能显示。
+- 窗口窄的时候 logo 自动挪到顶上，不跟文字挤一块。
 
 ## 安装
 
-需要 Python 3.8+。一键脚本会自动识别系统（Linux → `~/.local/bin`，Termux → `$PREFIX/bin`），下载并验证：
+Python 3.8 以上。跑一键脚本，它会认出系统是普通 Linux 还是 Termux，装到对应的目录（`~/.local/bin` 或 `$PREFIX/bin`），装完顺手验证一下：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/install.sh | bash
 ```
 
-不想跑脚本的话，手动下载也一样：
+不想跑脚本，手动也行：
 
 ```bash
 mkdir -p ~/.local/bin
@@ -54,8 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/
 chmod +x ~/.local/bin/nagisafetch
 ```
 
-确保 `~/.local/bin` 在 `PATH` 里，然后 `nagisafetch` 就能用了。
-
+记得把 `~/.local/bin` 加进 `PATH`，然后直接敲 `nagisafetch`。
 
 ## 用法
 
@@ -71,7 +70,7 @@ nagisafetch --logo off           # 不要 logo
 nagisafetch --list-fields        # 列出所有可用字段
 ```
 
-完整参数见 `nagisafetch --help`。
+完整参数看 `nagisafetch --help`。
 
 ### 图片 logo（kitty）
 
@@ -79,17 +78,17 @@ nagisafetch --list-fields        # 列出所有可用字段
 nagisafetch --logo-image ~/wallpaper.png --logo-image-width 22
 ```
 
-只支持 PNG（kitty 数据直传），JPEG 需先转换。需 kitty 或兼容 kitty graphics 协议的终端。
+只收 PNG，kitty 数据直传；JPEG 得先转一下。终端要支持 kitty graphics 协议，kitty 自己就行。
 
 ### 默认参数文件
 
-在 `~/.config/nagisafetch/default-args` 写命令行参数（shell 风格），每次启动自动前置：
+在 `~/.config/nagisafetch/default-args` 里写命令行参数，按 shell 的风格写，每次启动自动带上：
 
 ```
 -c sora --theme rose --logo-image ~/.config/nagisafetch/logo.png --logo-image-width 22
 ```
 
-显式传入的参数会覆盖文件里的同名参数。兼容旧路径 `~/.config/sysfetch/default-args`。
+命令行里显式传的参数会盖掉文件里的同名参数。老路径 `~/.config/sysfetch/default-args` 也认。
 
 ## 主题与预设
 
@@ -112,13 +111,13 @@ nagisafetch --logo-image ~/wallpaper.png --logo-image-width 22
 
 ## 字段
 
-`--list-fields` 查看全部。常用：OS、Host、Kernel、Uptime、Load Average、Processes、CPU、CPU Usage、GPU、Temperature、Memory、Swap、Disk、Battery、Packages、Shell、Terminal、WM、DE、Resolution、Locale、Fonts、Local/Public IP、VPN、Wi-Fi、Date & Time。
+`--list-fields` 列出全部。常用的这些：OS、Host、Kernel、Uptime、Load Average、Processes、CPU、CPU Usage、GPU、Temperature、Memory、Swap、Disk、Battery、Packages、Shell、Terminal、WM、DE、Resolution、Locale、Fonts、Local/Public IP、VPN、Wi-Fi、Date & Time。
 
 ## 平台
 
-- **Linux**：完整支持（推荐 Arch/Fedora/Debian 等主流发行版）
-- **Android (Termux)**：适配支持，部分字段（温度/进程/`/proc/stat`）受 Android 权限限制自动跳过
-- **Windows 原生**：不支持（依赖 `/proc`、`/sys`、`/etc/os-release`）；WSL 下可用但读到的是 WSL 虚拟机的信息
+- Linux：完整支持，Arch、Fedora、Debian 这些主流发行版都没问题
+- Android (Termux)：适配过，温度、进程、`/proc/stat` 这几项受 Android 权限限制，读不到就自动跳过
+- Windows 原生：不支持，它依赖 `/proc`、`/sys`、`/etc/os-release`。WSL 里能用，不过读到的是 WSL 虚拟机自己的信息
 
 ## License
 
