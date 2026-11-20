@@ -39,21 +39,22 @@
 
 ## 安装
 
-### Arch Linux (AUR)
+需要 Python 3.8+。一键脚本会自动识别系统（Linux → `~/.local/bin`，Termux → `$PREFIX/bin`），下载并验证：
 
 ```bash
-yay -S nagisafetch
+curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/install.sh | bash
 ```
 
-### 手动
-
-需要 Python 3.8+：
+不想跑脚本的话，手动下载也一样：
 
 ```bash
+mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/nagisafetch \
   -o ~/.local/bin/nagisafetch
 chmod +x ~/.local/bin/nagisafetch
 ```
+
+确保 `~/.local/bin` 在 `PATH` 里，然后 `nagisafetch` 就能用了。
 
 
 ## 用法
