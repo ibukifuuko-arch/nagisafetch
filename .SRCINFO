@@ -1,0 +1,12 @@
+pkgbase = nagisafetch
+	pkgdesc = Zero-dependency, themeable system information tool written in Python
+	pkgver = 1.0.0
+	pkgrel = 1
+	pkgurl = https://github.com/ibukifuuko-arch/nagisafetch
+	arch = any
+	license = MIT
+	depends = python
+	source = nagisafetch-1.0.0.tar.gz::https://github.com/ibukifuuko-arch/nagisafetch/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = nagisafetch

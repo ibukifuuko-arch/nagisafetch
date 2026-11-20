@@ -1,0 +1,1259 @@
+#!/usr/bin/env python3
+"""nagisafetch — 零依赖、可换主题的系统信息小工具。
+
+纯 Python 标准库实现，自动检测 WM / rice，不写死任何发行版或桌面名。
+设计照搬 fastfetch 的预设机制：-c PRESET 加载配置，-c all 列出全部字段。
+
+Usage:
+  nagisafetch [-c PRESET] [--theme NAME] [--logo NAME|off] [--no-color]
+              [--style grouped|classic] [--bars on|off] [--field KEY ...]
+              [--logo-position auto|left|top] [--title TITLE]
+              [--list-presets] [--list-themes] [--list-fields]
+
+  --logo-position auto 按终端宽度自适应：窄终端把 logo 挪到顶部，宽终端并排（默认）
+
+Presets:
+  default   常用字段（默认）
+  all       全部已实现字段（fastfetch -c all 风格，检测不到的自动跳过）
+  minimal   只留最核心几行
+  sora      四组布局（硬件/软件/桌面/时间），配 --theme sora 出四色主题
+
+Themes:
+  单色: arch / nord / dracula / gruvbox / kanagawa / rose
+  分组: sora（硬件绿·软件黄·桌面蓝·时间品红，来自 s0raLin/fastfetch-config）
+"""
+
+__version__ = "1.0.0"
+
+import argparse
+import base64
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# ANSI 颜色工具
+# --------------------------------------------------------------------------
+
+class Palette:
+    """把 24 位 RGB 转成 ANSI 真彩转义序列。"""
+
+    def __init__(self, accent=(88, 210, 255), group_colors=None):
+        self.accent = accent
+        self.group_colors = group_colors or {}
+        self.reset = "\033[0m"
+        self.bold = "\033[1m"
+        self.dim = "\033[2m"
+
+    def rgb(self, r, g, b, text, bold=False):
+        return f"\033[{1 if bold else 0};38;2;{r};{g};{b}m{text}{self.reset}"
+
+    def key(self, text):
+        r, g, b = self.accent
+        return self.rgb(r, g, b, text, bold=True)
+
+    def group_key(self, gname, text):
+        """按分组取色；某组没配色时回退到 accent。"""
+        r, g, b = self.group_colors.get(gname, self.accent)
+        return self.rgb(r, g, b, text, bold=True)
+
+    def val(self, text):
+        return text
+
+    def logo(self, text):
+        """logo 跟着主题走：整块用 accent 色。"""
+        r, g, b = self.accent
+        return self.rgb(r, g, b, text)
+
+    def sep(self, text=": "):
+        return self.dim + text + self.reset
+
+    def bar(self, pct, width=10):
+        """彩色进度条：低绿、中黄、高红。"""
+        filled = int(round(pct / 100 * width))
+        filled = max(0, min(width, filled))
+        if pct < 50:
+            r, g, b = 114, 209, 114
+        elif pct < 80:
+            r, g, b = 249, 196, 86
+        else:
+            r, g, b = 240, 113, 113
+        done = self.rgb(r, g, b, "█" * filled)
+        rest = self.dim + "░" * (width - filled) + self.reset
+        return f"{done}{rest} {pct:.0f}%"
+
+# --------------------------------------------------------------------------
+# 通用工具
+# --------------------------------------------------------------------------
+
+def run(cmd, timeout=3):
+    """执行命令，返回 stdout 全文；失败返回空串。"""
+    try:
+        out = subprocess.run(
+            cmd, shell=isinstance(cmd, str), capture_output=True,
+            text=True, timeout=timeout,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+def read_file(path):
+    try:
+        return Path(os.path.expanduser(path)).read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+def human_bytes(num):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(num) < 1024:
+            return f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} PiB"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def visible_len(s):
+    """去掉 ANSI 转义后的可见字符宽度。"""
+    return len(ANSI_RE.sub("", s))
+
+def trim_visible(s, maxw):
+    """按可见宽度截断字符串（保留 ANSI 颜色），超出用 … 收尾。"""
+    if maxw <= 0:
+        return ""
+    if visible_len(s) <= maxw:
+        return s
+    out, i, vis, limit = [], 0, 0, maxw - 1
+    while i < len(s) and vis < limit:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        out.append(s[i])
+        vis += 1
+        i += 1
+    out.append("…" + pal_reset_cache)
+    return "".join(out)
+
+# 由 main 注入当前调色板的 reset 序列（no-color 下为空串）
+pal_reset_cache = ""
+
+def is_termux():
+    """是否运行在 Termux（Android 用户空间）。
+    只信环境变量特征（PREFIX/HOME/TMUX 里的 com.termux 路径），
+    不靠单一绝对路径——普通 Linux 上该路径可能被误建导致误判。
+    """
+    signals = (
+        os.environ.get("PREFIX", ""),
+        os.environ.get("HOME", ""),
+        os.environ.get("TERMUX_VERSION", ""),
+        os.environ.get("XDG_RUNTIME_DIR", ""),
+    )
+    return any("com.termux" in s for s in signals) or bool(os.environ.get("TERMUX_VERSION"))
+
+def getprop(key):
+    """读 Android 系统属性（getprop），失败返回空串。"""
+    for exe in ("/system/bin/getprop", "getprop"):
+        if shutil.which(exe) or os.path.isfile(exe):
+            v = run([exe, key], timeout=2)
+            if v:
+                return v
+    return ""
+
+# --------------------------------------------------------------------------
+# Logo 库（ASCII）
+# --------------------------------------------------------------------------
+
+LOGOS = {
+    # 默认：fastfetch 经典 arch 大三角（19 行原版，实心精致）
+    "arch": [
+        r"                  -`                 ",
+        r"                 .o+`                ",
+        r"                `ooo/                ",
+        r"               `+oooo:               ",
+        r"              `+oooooo:              ",
+        r"              -+oooooo+:             ",
+        r"            `/:-:++oooo+:            ",
+        r"           `/++++/+++++++:           ",
+        r"          `/++++++++++++++:          ",
+        r"         `/+++ooooooooooooo/`        ",
+        r"        ./ooosssso++osssssso+`       ",
+        r"       .oossssso-````/ossssss+`      ",
+        r"      -osssssso.      :ssssssso.     ",
+        r"     :osssssss/        osssso+++.    ",
+        r"    /ossssssss/        +ssssooo/-    ",
+        r"  `/ossssso+/:-        -:/+osssso+-  ",
+        r" `+sso+:-`                 `.-/+oso: ",
+        r"`++:.                           `-/+/",
+        r".`                                 `/",
+    ],
+    # 虚线线条版（--logo arch-line）：行数少，窄屏顶置时更省高度
+    "arch-line": [
+        r"       /\       ",
+        r"      /  \      ",
+        r"     / /\ \     ",
+        r"    / /  \ \    ",
+        r"   / /____\ \   ",
+        r"  / /\    /\ \  ",
+        r" / /  \  /  \ \ ",
+        r"/_/    \/    \_\ ",
+    ],
+    # 紧凑版：终端窄、或 classic/minimal 时用（--logo arch-small）
+    "arch-small": [
+        r"       /\       ",
+        r"      /  \      ",
+        r"     / /\ \     ",
+        r"    / /  \ \    ",
+        r"   /_/    \_\   ",
+    ],
+    "linux": [
+        "    .--.        ",
+        "   |o_o |       ",
+        "   |:_/ |       ",
+        "  //   \\ \\      ",
+        " ('|     |)     ",
+        " \\___=_/       ",
+    ],
+    "debian": [
+        "   ,-------.    ",
+        "  /  ___   \\   ",
+        " |  /   \\  |   ",
+        " |  \\___/  |   ",
+        "  \\_______/    ",
+    ],
+    "android": [
+        '         -o          o-',
+        '          +hydNNNNdyh+',
+        '        +mMMMMMMMMMMMMm+',
+        '      `dMMm:NMMMMMMN:mMMd`',
+        '      hMMMMMMMMMMMMMMMMMMh',
+        '  ..  yyyyyyyyyyyyyyyyyyyy  ..',
+        '.mMMm`MMMMMMMMMMMMMMMMMMMM`mMMm.',
+        ':MMMM-MMMMMMMMMMMMMMMMMMMM-MMMM:',
+        ':MMMM-MMMMMMMMMMMMMMMMMMMM-MMMM:',
+        ':MMMM-MMMMMMMMMMMMMMMMMMMM-MMMM:',
+        ':MMMM-MMMMMMMMMMMMMMMMMMMM-MMMM:',
+        '-MMMM-MMMMMMMMMMMMMMMMMMMM-MMMM-',
+        ' +yy+ MMMMMMMMMMMMMMMMMMMM +yy+',
+        '      mMMMMMMMMMMMMMMMMMMm',
+        '      `/++MMMMh++hMMMM++/`',
+        '          MMMMo  oMMMM',
+        '          MMMMo  oMMMM',
+        '          oNMm-  -mMNs',
+    ],
+}
+LOGOS["arch-full"] = LOGOS["arch"]  # 兼容旧用法：arch 现在就是原版
+
+def image_dimensions(data):
+    """从 PNG / JPEG 字节里读 (宽, 高)，零依赖。识别不了返回 None。"""
+    # PNG: 签名 + IHDR 块，宽高固定在第 16-24 字节
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", data[16:24])
+        return (w, h) if w and h else None
+    # JPEG: 扫描标记段，找 SOF0/SOF2 里的宽高
+    if len(data) >= 4 and data[:3] == b"\xff\xd8\xff":
+        i, n = 2, len(data)
+        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while i < n - 9:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            m = data[i + 1]
+            if m == 0x00 or m == 0xFF or 0xD0 <= m <= 0xD9:
+                i += 2
+                continue
+            if i + 4 > n:
+                break
+            seglen = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if m in sof and i + 9 <= n:
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return (w, h) if w and h else None
+            i += 2 + seglen
+    return None
+
+def kitty_image_escape(path, width=40, height=None, align="left"):
+    """用 kitty graphics 协议的 kitty-direct 方式显示图片，照抄 fastfetch image.c:387。
+
+    fastfetch 的 kitty-direct 走 t=f：base64 编码的是【文件路径】，让终端自己读文件、
+    自己按 c=width 缩放。之前用 t=d（数据直传）+ c/r 缩放不可靠，图片会铺满/裁切——
+    根因是 f=100 数据直传时 kitty 不按 c/r 缩放。t=f 是 fastfetch 验证过的方式，
+    效果与 fastfetch 完全一致（前提是终端能访问该路径，本机 kitty 满足）。
+    返回 (序列字符串, 占用行数)；文件不存在返回 (None, 0)。
+    """
+    p = Path(os.path.expanduser(path)).resolve()
+    if not p.is_file():
+        return None, 0
+    # fastfetch: "\e_Ga=T,f=100,t=f,c=%u;%s\e\\" —— base64 是路径字符串，非图片字节
+    b64 = base64.b64encode(str(p).encode("utf-8")).decode("ascii")
+    head = f"\033_Ga=T,f=100,t=f,c={width}"
+    if height:
+        head += f",r={height}"
+    return head + ";" + b64 + "\033\\", 0
+
+def detect_logo():
+    """按 /etc/os-release 猜一个 logo；Termux 下用 android。"""
+    if is_termux():
+        return "android"
+    rel = read_file("/etc/os-release").lower()
+    for key, name in (("arch", "arch"), ("debian", "debian"), ("ubuntu", "debian"),
+                      ("fedora", "linux")):
+        if key in rel:
+            return name
+    return "linux"
+
+# --------------------------------------------------------------------------
+# 字段检测器：每个函数返回 (value_str, pct_or_None)
+# value_str 为 None 时该字段自动跳过（fastfetch 风格：检测不到就不显示）
+# pct 用于画占用条；None 表示不画条
+# --------------------------------------------------------------------------
+
+def f_user():
+    # Termux 默认不设 $USER；$HOSTNAME 也常为空，platform.node() 是 localhost。
+    # 用户名退到 whoami / id -un（u0_aXXX），hostname 优先 getprop net.hostname。
+    user = os.environ.get("USER") or ""
+    if not user:
+        user = run(["whoami"]) or run(["id", "-un"]) or "?"
+    host = platform.node()
+    if is_termux():
+        host = getprop("net.hostname") or host
+    return f"{user}@{host}", None
+
+def f_os():
+    if is_termux():
+        # Termux 没有 /etc/os-release，从 getprop 读 Android 版本
+        ver = getprop("ro.build.version.release")
+        sdk = getprop("ro.build.version.sdk")
+        parts = []
+        if ver:
+            parts.append(f"Android {ver}")
+        else:
+            parts.append("Android")
+        if sdk:
+            parts.append(f"SDK {sdk}")
+        parts.append("Termux")
+        return (" ".join(parts) + f" ({platform.machine()})"), None
+    pretty = ""
+    for line in read_file("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            pretty = line.split("=", 1)[1].strip('"')
+            break
+    return (pretty or platform.system()) + f" ({platform.machine()})", None
+
+def f_kernel():
+    if is_termux():
+        # Android 的 platform.release() 会返回 Android 大版本号（这里是 16），
+        # 真正的 Linux 内核版本要读 /proc/version 或 uname -r。
+        v = read_file("/proc/version")
+        m = re.search(r"Linux version\s+(\S+)", v)
+        if m:
+            return m.group(1), None
+        k = run(["uname", "-r"])
+        if k:
+            return k, None
+    return platform.release(), None
+
+def f_host():
+    if is_termux():
+        model = getprop("ro.product.model")
+        brand = getprop("ro.product.brand")
+        if model and brand:
+            return f"{brand} {model}", None
+        if model:
+            return model, None
+        return platform.node(), None
+    for p in ("/sys/class/dmi/id/product_name", "/sys/class/dmi/id/board_name"):
+        v = read_file(p)
+        if v:
+            return v, None
+    return platform.node(), None
+
+def f_wm():
+    """从运行中的进程判断当前 WM/DE，比写死的 rice 靠谱。"""
+    wm_map = {
+        "Hyprland": "Hyprland", "hyprland": "Hyprland",
+        "niri": "niri", "sway": "sway", "i3": "i3", "bspwm": "bspwm",
+        "kwin_wayland": "KDE Plasma", "gnome-shell": "GNOME",
+        "xfwm4": "XFCE", "mutter": "GNOME", "labwc": "labwc",
+    }
+    try:
+        out = subprocess.run(["ps", "-eo", "comm="], capture_output=True,
+                             text=True, timeout=3).stdout.splitlines()
+        procs = {p.strip() for p in out}
+        for proc, name in wm_map.items():
+            if proc in procs:
+                return name, None
+    except Exception:
+        pass
+    if is_termux():
+        return "Termux", None
+    return os.environ.get("XDG_CURRENT_DESKTOP", "Unknown"), None
+
+def f_shell():
+    sh = os.path.basename(os.environ.get("SHELL", ""))
+    return sh or "?", None
+
+def f_term():
+    if os.environ.get("KITTY_WINDOW_ID") or os.environ.get("KITTY_LISTEN_ON"):
+        return "kitty", None
+    if os.environ.get("TERM_PROGRAM"):
+        return os.environ["TERM_PROGRAM"], None
+    if os.environ.get("WT_SESSION"):
+        return "Windows Terminal", None
+    if os.environ.get("SSH_TTY") or os.environ.get("SSH_CONNECTION"):
+        term = os.environ.get("TERM", "")
+        return ("ssh" + (f" ({term})" if term else "")), None
+    term = os.environ.get("TERM", "")
+    return (term if term and term != "unknown" else None), None
+
+def f_cpu():
+    """线程数用 os.cpu_count()；物理核数从 cpuinfo 的 physical id+core id 去重。
+    Android cpuinfo 通常没有这两项、也没有 model name，fallback 到 Hardware/Processor。
+    """
+    cpuinfo = read_file("/proc/cpuinfo")
+    model = ""
+    for line in cpuinfo.splitlines():
+        if line.startswith("model name"):
+            model = line.split(":", 1)[1].strip()
+            break
+    # Android/ARM fallback
+    if not model:
+        for line in cpuinfo.splitlines():
+            if line.startswith(("Hardware", "Processor", "CPU model")):
+                model = line.split(":", 1)[1].strip()
+                break
+    if not model and is_termux():
+        model = getprop("ro.hardware") or None
+
+    threads = os.cpu_count() or 0
+    # 数 (physical id, core id) 对得到真实物理核数
+    phys_id = core_id = None
+    pairs = set()
+    for line in cpuinfo.splitlines():
+        if line.startswith("physical id"):
+            phys_id = line.split(":", 1)[1].strip()
+        elif line.startswith("core id"):
+            core_id = line.split(":", 1)[1].strip()
+        if phys_id is not None and core_id is not None:
+            pairs.add((phys_id, core_id))
+    cores = len(pairs) if pairs else None
+    model = re.sub(r"\s+", " ", model).strip() if model else model
+    if model and threads:
+        if cores and cores != threads:
+            return f"{model} ({cores}c/{threads}t)", None
+        return f"{model} ({threads}t)", None
+    return (model or platform.processor() or None), None
+
+def f_gpu():
+    if not shutil.which("lspci"):
+        return None, None
+    out = run(["lspci"])
+    matches = [l for l in out.splitlines() if re.search(r"vga|3d|display", l, re.I)]
+    if not matches:
+        return None, None
+    line = matches[0]
+    name = re.sub(r"^.*?: ", "", line).split(" (")[0]
+    # 精简冗长厂商前缀（lspci 的 vendor 全称太占宽度）
+    for long, short in (
+        ("Advanced Micro Devices, Inc. [AMD/ATI]", "AMD/ATI"),
+        ("Advanced Micro Devices, Inc. [AMD]", "AMD"),
+        ("NVIDIA Corporation", "NVIDIA"),
+        ("Intel Corporation", "Intel"),
+        ("Matrox Electronics Systems Ltd.", "Matrox"),
+    ):
+        name = name.replace(long, short)
+    return re.sub(r"\s+", " ", name).strip(), None
+
+def f_cpu_usage():
+    """CPU 实时占用率：读 /proc/stat 两次取 0.3s 差。
+    Android/Termux 上 /proc/stat 常被拒，返回 None 让该字段自动跳过。"""
+    def _snap():
+        first = read_file("/proc/stat").splitlines()[0] if read_file("/proc/stat") else ""
+        m = re.match(r"^cpu\s+(.+)", first)
+        if not m:
+            return None
+        vals = [int(x) for x in m.group(1).split()[:8]]
+        if len(vals) < 4:
+            return None
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return sum(vals), idle
+    try:
+        a = _snap()
+        if not a:
+            return None, None
+        time.sleep(0.3)
+        b = _snap()
+        if not b:
+            return None, None
+        dt, di = b[0] - a[0], b[1] - a[1]
+        if dt <= 0:
+            return None, None
+        pct = max(0.0, min(100.0, (1 - di / dt) * 100))
+        return f"{pct:.0f}%", pct
+    except Exception:
+        return None, None
+
+def f_mem():
+    info = {}
+    for line in read_file("/proc/meminfo").splitlines():
+        parts = line.split(":")
+        if len(parts) == 2:
+            info[parts[0]] = int(parts[1].strip().split()[0])
+    total = info.get("MemTotal", 0) * 1024
+    avail = info.get("MemAvailable", info.get("MemFree", 0)) * 1024
+    used = total - avail
+    if not total:
+        return None, None
+    pct = used / total * 100
+    return f"{human_bytes(used)} / {human_bytes(total)} ({pct:.0f}%)", pct
+
+def f_disk():
+    try:
+        # Termux: / 是只读系统分区，改用 $HOME（真正的用户数据分区）
+        target = os.environ.get("HOME", "/") if is_termux() else "/"
+        st = os.statvfs(target)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        pct = used / total * 100
+        return f"{human_bytes(used)} / {human_bytes(total)} ({pct:.0f}%)", pct
+    except Exception:
+        return None, None
+
+def f_up():
+    try:
+        up = float(read_file("/proc/uptime").split()[0])
+        h, rem = divmod(int(up), 3600)
+        m, s = divmod(rem, 60)
+        if h >= 24:
+            d, h = divmod(h, 24)
+            return f"{d}d {h}h {m}m", None
+        return f"{h}h {m}m {s}s", None
+    except Exception:
+        return None, None
+
+def f_pkgs():
+    if shutil.which("pacman"):
+        n = len(run(["pacman", "-Q"]).splitlines())
+        return f"{n} (pacman)", None
+    if shutil.which("dpkg"):
+        n = len(run(["dpkg", "-l"]).splitlines())
+        return f"{n} (dpkg)", None
+    return None, None
+
+def f_res():
+    # 优先从 DRM sysfs 读，不依赖 display 环境（SSH 里也能拿到）
+    for p in sorted(Path("/sys/class/drm").glob("card*-*/modes")):
+        first = read_file(str(p)).splitlines()
+        if first:
+            m = re.match(r"(\d{3,4})x(\d{3,4})", first[0])
+            if m:
+                return f"{m.group(1)}x{m.group(2)}", None
+    out = run(["xrandr", "--current"] if shutil.which("xrandr") else ["wlr-randr"])
+    m = re.search(r"(\d{3,4})x(\d{3,4})", out)
+    return (f"{m.group(1)}x{m.group(2)}" if m else None), None
+
+def f_theme():
+    """GTK 主题（若有）。"""
+    v = run(["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"])
+    v = v.strip("'") if v else ""
+    return (v or None), None
+
+def f_rice():
+    """auto-detect rice：显式配置 > nyxniri 主题 > WM 名。跨 WM 通用。"""
+    # 1) 用户在任意 WM 配置里显式写的 rice = "..."（最高优先）
+    for cfg in ("~/.config/hypr/hyprland.lua", "~/.config/niri/config.kdl",
+                "~/.config/niri/config.niri"):
+        m = re.search(r'rice\s*=\s*["\']([^"\']+)["\']', read_file(cfg))
+        if m:
+            return m.group(1), None
+
+    # 2) nyxniri rice 项目（跨 Niri/MangoWM/Hyprland + Noctalia/自研 shell）
+    nyx_markers = (
+        "~/.local/state/NyxNiri/nyxniri.link",
+        "~/.local/share/fcitx5/themes/nyxmellow/theme.conf",
+        "~/.config/noctalia/noctalia-config.toml",
+    )
+    if any(os.path.isdir(os.path.expanduser(m)) or os.path.isfile(os.path.expanduser(m))
+           for m in nyx_markers):
+        themes_dir = os.path.expanduser("~/.local/share/fcitx5/themes")
+        try:
+            for d in sorted(os.listdir(themes_dir)):
+                if d.lower().startswith("nyx") and \
+                   os.path.isdir(os.path.join(themes_dir, d)):
+                    return "Nyx" + d[3:].capitalize(), None
+        except OSError:
+            pass
+        return "NyxNiri", None
+
+    # 3) 兜底：当前 WM 名
+    wm, _ = f_wm()
+    return wm, None
+
+# ---- 以下字段默认不显示，只在 -c all 或 --field 显式指定时出现 ----------------
+
+def _udp_local_ip():
+    """用 UDP connect 拿本机出口 IPv4：只让内核按路由表选源地址，不发包、不需要
+    netlink/root。这是 Termux 非 root 下唯一稳定的办法。"""
+    for target in (("223.5.5.5", 53), ("8.8.8.8", 80)):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(target)  # UDP connect 不发包，仅确定源地址
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            continue
+    return None
+
+def _net_ifaces():
+    """枚举 (接口名, IPv4/CIDR) 列表。返回 [(iface, '10.0.0.5/24'), ...]。
+
+    PC:       iproute2 的 -br / addr show。
+    Termux:   Android 的 ip 命令在非 root 下会报
+              "Cannot bind netlink socket: Permission denied"，
+              全程绕开 netlink：getprop → UDP 连接法 → 读 /proc/net/fib_trie。
+    """
+    result = []
+
+    # ---- Termux / Android：不碰 ip 命令（netlink 无权限） ----
+    if is_termux():
+        # 1) getprop：部分 ROM 会把 wlan0 地址写进 dhcp.wlan0.ipaddress
+        for key in ("dhcp.wlan0.ipaddress", "dhcp.wlan0.ip", "dhcp.eth0.ipaddress"):
+            raw = getprop(key)
+            if not raw:
+                continue
+            for tok in re.split(r"[\s,]+", raw):
+                if "/" in tok:
+                    ip, mask = tok.split("/", 1)
+                else:
+                    ip, mask = tok, "24"
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and not ip.startswith("127."):
+                    iface = "eth0" if "eth0" in key else "wlan0"
+                    if (iface, f"{ip}/{mask}") not in result:
+                        result.append((iface, f"{ip}/{mask}"))
+            if result:
+                return result
+
+        # 2) UDP connect：内核按路由表选源地址，不发包、不需要 root/netlink
+        ip = _udp_local_ip()
+        if ip:
+            return [("wlan0", ip + "/24")]
+
+        # 3) 兜底：解析 /proc/net/fib_trie（纯读文件，无 netlink）
+        try:
+            lines = Path("/proc/net/fib_trie").read_text(errors="replace").splitlines()
+            for i, line in enumerate(lines):
+                if "/32 host LOCAL" not in line or i == 0:
+                    continue
+                prev = lines[i - 1]
+                if "|-- 127." in prev:
+                    continue
+                m = re.search(r"\|\-\- (\d+\.\d+\.\d+\.\d+)", prev)
+                if m:
+                    ip = m.group(1)
+                    if not ip.startswith("127.") and not any(ip == x[1].split("/")[0] for x in result):
+                        result.append(("wlan0", ip + "/32"))
+        except OSError:
+            pass
+        return result
+
+    # ---- 普通 Linux：原逻辑 ----
+    out = run(["ip", "-4", "-br", "addr"])
+    if out:  # iproute2 风格: "eth0  UP  192.168.1.5/24"
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                iface = parts[0].rstrip(":").split("@")[0]
+                for tok in parts[2:]:
+                    if re.match(r"^\d+\.\d+\.\d+\.\d+/\d+$", tok):
+                        result.append((iface, tok))
+    if not result:  # 老 ip "ip -4 addr show" / ifconfig
+        out = run(["ip", "-4", "addr", "show"]) or run(["ifconfig", "-a"])
+        iface = None
+        for line in out.splitlines():
+            m = re.match(r"^\d+:\s+([\w@.\-]+):", line)
+            if not m:
+                m = re.match(r"^([a-zA-Z][\w.\-]*)\s+Link\s+encap", line)
+            if m:
+                iface = m.group(1).split("@")[0]
+                continue
+            m = re.search(r"inet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+/\d+)", line)
+            if m and iface and iface != "lo":
+                result.append((iface, m.group(1)))
+    return result
+
+def f_ip():
+    """本机非回环 IPv4，多个用逗号分隔。"""
+    ips = []
+    for iface, cidr in _net_ifaces():
+        if iface == "lo" or cidr.startswith("127."):
+            continue  # 回环地址不算（Termux/toybox 的 ip -br 常把 lo 混进来）
+        ips.append(f"{iface}: {cidr}")
+    return (", ".join(ips) if ips else None), None
+
+def f_vpn():
+    """单独的 VPN 虚拟网卡 IP（tun/wg/tailscale/zerotier）。"""
+    ips = [f"{iface}: {cidr}" for iface, cidr in _net_ifaces()
+           if re.match(r"^(tun|tap|wg|tailscale|zerotier|zt|ppp)", iface)]
+    return (", ".join(ips) if ips else None), None
+
+def _binder_battery_prop(prop_id):
+    """照 fastfetch：app UID 下 /sys/class/power_supply 对用户封闭，
+    走 Binder 服务 batteryproperties 的 IBatteryPropertiesRegistrar.getProperty。
+    事务码 1 = getProperty；Parcel = [exception][ret][hasValue][int64 value]，
+    容量/状态的 int64 在小端 offset 12 处。返回 int 或 None。"""
+    svc = "/system/bin/service"
+    if not os.path.isfile(svc):
+        return None
+    out = run([svc, "call", "batteryproperties", "1", "i32", str(prop_id)], timeout=4)
+    if "Parcel(" not in out or "NULL" in out or "Error" in out:
+        return None
+    # 抓 0x00000000: 行里的 4 组 8-hex word；值在第 4 组（offset 12）
+    words = re.findall(r"0x[0-9a-fA-F]{8}:\s+((?:[0-9a-fA-F]{8}\s+){3,4})", out)
+    if not words:
+        return None
+    row = words[0].split()
+    if len(row) < 4:
+        return None
+    try:
+        val = int(row[3], 16)  # 低 32 位即容量/状态（高 32 位为 0）
+        # 负数按 64 位补码还原；0x80000000 以上且高位非 0 视为无效
+        if val > 0x7FFFFFFF:
+            return None
+        return val
+    except ValueError:
+        return None
+
+def f_battery():
+    """电池容量。Termux 照 fastfetch 走 Binder + getprop（sysfs 对 app 封闭）。"""
+    if is_termux():
+        # 状态：fastfetch 读 debug.tracing.battery_status（1未知 2充电 3放电 4未充 5满）
+        status_map = {"1": "Unknown", "2": "Charging", "3": "Discharging",
+                      "4": "Not charging", "5": "Full"}
+        st = getprop("debug.tracing.battery_status")
+        plug = getprop("debug.tracing.plug_type")  # bitmask: 1 AC 2 USB 4 wireless
+        plug_txt = ""
+        if plug and plug.isdigit():
+            p = int(plug)
+            plug_txt = ", ".join(x for x, bit in (("AC", 1), ("USB", 2), ("Wireless", 4)) if p & bit)
+        # 容量：Binder getProperty(4)
+        pct = _binder_battery_prop(4)
+        if pct is not None:
+            label = status_map.get(st, "")
+            extra = label or plug_txt
+            return (f"{pct}% [{extra}]" if extra else f"{pct}%"), pct
+        # 次选：termux-api（若 app 已授权）
+        out = run(["termux-battery-status"], timeout=3)
+        if out:
+            try:
+                d = json.loads(out)
+                pct = d.get("percentage")
+                if pct is not None:
+                    extra = d.get("status") or d.get("plugged") or ""
+                    return (f"{pct}% [{extra}]" if extra and extra != "UNPLUGGED" else f"{pct}%"), pct
+            except Exception:
+                pass
+    # Linux / root Termux: 走 sysfs（BAT* 或 Android 小写 battery）
+    supply = Path("/sys/class/power_supply")
+    candidates = list(supply.glob("BAT*")) + list(supply.glob("battery")) + \
+                 list(supply.glob("Battery*"))
+    for p in sorted(candidates):
+        cap = read_file(str(p / "capacity"))
+        if cap:
+            status = read_file(str(p / "status"))
+            return (f"{cap}% [{status}]" if status else f"{cap}%"), None
+    return None, None
+
+def f_wifi():
+    """Wi-Fi SSID。Termux 走 termux-wifi-connectioninfo，Linux 走 iwgetid/nmcli。"""
+    if is_termux():
+        out = run(["termux-wifi-connectioninfo"], timeout=3)
+        if out:
+            try:
+                ssid = json.loads(out).get("ssid")
+                if ssid and ssid != "<unknown ssid>":
+                    return ssid, None
+            except Exception:
+                pass
+        return None, None
+    ssid = run(["iwgetid", "-r"], timeout=2)
+    if not ssid and shutil.which("nmcli"):
+        # nmcli: 从 "*:SSID" 或 "SSID" 行里取当前连接的那个
+        out = run(["nmcli", "-t", "-f", "IN-USE,SSID", "dev", "wifi"], timeout=3)
+        for line in out.splitlines():
+            parts = line.split(":", 1)
+            if parts and parts[0].strip() == "*" and len(parts) > 1:
+                ssid = parts[1].strip()
+                break
+            elif line.strip() and not line.startswith(":"):
+                ssid = line.split(":", 1)[-1].strip()
+    return (ssid or None), None
+
+def f_loadavg():
+    v = read_file("/proc/loadavg")
+    if v:
+        parts = v.split()
+        if len(parts) >= 3:
+            return " ".join(parts[:3]), None
+    # Android/Termux 上 /proc/loadavg 是 Permission denied，从 uptime 抠
+    out = run(["uptime"])
+    m = re.search(r"load averages?:\s*([\d., ]+)", out, re.I)
+    if m:
+        vals = [x.strip() for x in re.split(r"[,\s]+", m.group(1).strip()) if x.strip()][:3]
+        if vals:
+            return " ".join(vals), None
+    return None, None
+
+def f_datetime():
+    """日期时间：date 命令（Android 上比读文件通用）。"""
+    out = run(["date", "+%Y-%m-%d %H:%M:%S %Z"])
+    return (out or None), None
+
+def f_pubip():
+    """公网出口 IP：优先 HTTPS，失败退 HTTP（Termux 上 443 常被拒、80 可用）。
+    走 curl 而非 urllib，避免 Python 代理/证书差异。失败静默跳过。"""
+    if not shutil.which("curl"):
+        return None, None
+    for url in ("https://api.ipify.org", "http://ipv4.icanhazip.com",
+                "http://ipecho.net/plain"):
+        out = run(["curl", "-fsSL", "--max-time", "4", url], timeout=6)
+        ip = (out or "").strip()
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+            return ip, None
+    return None, None
+
+def f_procs():
+    try:
+        procs = [p for p in os.listdir("/proc") if p.isdigit()]
+        threads = 0
+        for p in procs:
+            status = read_file(f"/proc/{p}/status")
+            m = re.search(r"^Threads:\s+(\d+)", status, re.M)
+            if m:
+                threads += int(m.group(1))
+        return (f"{len(procs)} ({threads} threads)" if threads else str(len(procs))), None
+    except Exception:
+        return None, None
+
+def f_swap():
+    info = {}
+    for line in read_file("/proc/meminfo").splitlines():
+        parts = line.split(":")
+        if len(parts) == 2:
+            info[parts[0]] = int(parts[1].strip().split()[0])
+    total = info.get("SwapTotal", 0) * 1024
+    if not total:
+        return None, None
+    free = info.get("SwapFree", 0) * 1024
+    used = total - free
+    pct = used / total * 100
+    return f"{human_bytes(used)} / {human_bytes(total)} ({pct:.0f}%)", pct
+
+def f_temp():
+    """CPU 温度：遍历 thermal zone，取温度最高的那个。"""
+    best = None
+    for p in sorted(Path("/sys/class/thermal").glob("thermal_zone*/temp")):
+        try:
+            v = int(read_file(str(p))) / 1000
+            label = read_file(str(p.parent / "type")) or "thermal"
+            if best is None or v > best[1]:
+                best = (label, v)
+        except Exception:
+            continue
+    if best is None:
+        return None, None
+    return f"{best[0]}: {best[1]:.0f}°C", None
+
+def f_de():
+    """桌面环境（XDG_CURRENT_DESKTOP），没有就跳过。"""
+    v = os.environ.get("XDG_CURRENT_DESKTOP")
+    return (v or None), None
+
+def f_init():
+    """Init 系统（从 PID 1 的 comm 猜）。"""
+    init = read_file("/proc/1/comm")
+    if not init:
+        return None, None
+    ver = run([init, "--version"], timeout=2)
+    first = ver.splitlines()[0] if ver else ""
+    return (f"{init} {first}" if first else init), None
+
+def f_locale():
+    loc = os.environ.get("LC_ALL") or os.environ.get("LANG")
+    return (loc or None), None
+
+def f_fonts():
+    if shutil.which("fc-list"):
+        n = len(run(["fc-list", ":"], timeout=5).splitlines())
+        return (f"{n} (fontconfig)" if n else None), None
+    return None, None
+
+FIELDS = {
+    "user": ("User", f_user), "os": ("OS", f_os), "kern": ("Kernel", f_kernel),
+    "host": ("Host", f_host), "wm": ("WM", f_wm), "de": ("DE", f_de),
+    "shell": ("Shell", f_shell), "term": ("Terminal", f_term),
+    "cpu": ("CPU", f_cpu), "cpu_usage": ("CPU Usage", f_cpu_usage),
+    "gpu": ("GPU", f_gpu),
+    "mem": ("Memory", f_mem), "disk": ("Disk (/)", f_disk), "up": ("Uptime", f_up),
+    "pkgs": ("Packages", f_pkgs), "res": ("Resolution", f_res),
+    "theme": ("Theme", f_theme), "rice": ("rice", f_rice),
+    # all 专属
+    "ip": ("Local IP", f_ip), "vpn": ("VPN IP", f_vpn), "wifi": ("Wi-Fi", f_wifi),
+    "bat": ("Battery", f_battery), "load": ("Load Average", f_loadavg),
+    "procs": ("Processes", f_procs), "swap": ("Swap", f_swap),
+    "temp": ("Temperature", f_temp), "init": ("Init System", f_init),
+    "locale": ("Locale", f_locale), "fonts": ("Fonts", f_fonts),
+    "datetime": ("Date & Time", f_datetime), "pubip": ("Public IP", f_pubip),
+}
+
+DEFAULT_GROUPS = {
+    "system": ["os", "host", "kern", "wm", "shell", "term", "pkgs", "theme"],
+    "hardware": ["cpu", "cpu_usage", "gpu", "res", "mem", "disk", "up", "rice"],
+}
+
+ALL_GROUPS = {
+    "system": ["user", "os", "host", "kern", "init", "wm", "de", "shell", "term",
+               "theme", "locale", "pkgs", "fonts", "up", "load", "procs", "datetime"],
+    "hardware": ["cpu", "cpu_usage", "temp", "gpu", "res", "mem", "swap", "disk", "bat", "rice"],
+    "network": ["ip", "pubip", "vpn", "wifi"],
+}
+
+# 预设：照 fastfetch -c PRESET 的机制。all 列出全部字段（检测不到的自动跳过）。
+SORA_GROUPS = {
+    "hardware": ["cpu", "cpu_usage", "gpu", "mem", "disk", "temp"],
+    "software": ["os", "kern", "pkgs", "shell", "theme"],
+    "desktop": ["wm", "de", "rice", "term", "res"],
+    "time": ["up", "load", "procs"],
+}
+
+PRESETS = {
+    "default": {"style": "grouped", "groups": DEFAULT_GROUPS},
+    "minimal": {"style": "classic", "fields": ["os", "host", "kern", "wm", "cpu", "gpu", "mem", "up"]},
+    "all": {"style": "grouped", "groups": ALL_GROUPS},
+    # 照 s0raLin/fastfetch-config 的四组配色布局（配 --theme sora 出四色效果）
+    "sora": {"style": "grouped", "groups": SORA_GROUPS},
+}
+
+THEMES = {
+    "arch": (23, 147, 209),
+    "nord": (136, 192, 208),
+    "dracula": (189, 147, 249),
+    "gruvbox": (215, 153, 112),
+    "kanagawa": (106, 198, 211),
+    "rose": (233, 163, 201),
+    "sora": (189, 147, 249),  # accent 取品红（time 组色），logo 跟着走
+}
+
+# 分组配色：硬件绿 / 软件黄 / 桌面蓝 / 时间品红（来自 s0raLin/fastfetch-config）
+# 键同时兼容 default/all 预设的组名（system/network），让 --theme sora 在任何预设下都上色
+GROUP_THEMES = {
+    "sora": {
+        "hardware": (114, 209, 114),  # 绿
+        "software": (249, 196, 86),   # 黄
+        "desktop": (88, 166, 255),    # 蓝
+        "time": (189, 147, 249),      # 品红
+        "system": (249, 196, 86),     # 兼容 default/all 的 system 组 → 黄
+        "network": (88, 166, 255),    # 兼容 all 的 network 组 → 蓝
+    },
+}
+
+# --------------------------------------------------------------------------
+# 渲染
+# --------------------------------------------------------------------------
+
+def label_for(key, label):
+    """按环境微调标签。"""
+    if key == "disk" and is_termux():
+        return "Disk (~)"
+    return label
+
+def build_lines(cfg, args, pal):
+    """返回 (label, value, pct) 行；value 为 None 的字段自动跳过。"""
+    groups = cfg.get("groups", DEFAULT_GROUPS)
+    fields = cfg.get("fields")
+    rows = []
+
+    if args.style == "classic":
+        order = fields or [k for g in groups.values() for k in g]
+        for key in order:
+            if key not in FIELDS:
+                continue
+            label, fn = FIELDS[key]
+            try:
+                val, pct = fn()
+            except Exception:
+                continue
+            if val is None:
+                continue
+            rows.append((label_for(key, label), val, pct))
+    else:
+        for gname, keys in groups.items():
+            got = []
+            for key in keys:
+                if key not in FIELDS:
+                    continue
+                label, fn = FIELDS[key]
+                try:
+                    val, pct = fn()
+                except Exception:
+                    continue
+                if val is None:
+                    continue
+                got.append((label_for(key, label), val, pct))
+            if got:
+                rows.append((f"__GROUP__{gname}", "", None))
+                rows.extend(got)
+    return rows
+
+def render(cfg, args, pal):
+    rows = build_lines(cfg, args, pal)
+    indent = "  "
+
+    # 图片 logo（kitty graphics）：并排布局，图片在左、信息在右（fastfetch 风格）。
+    # kitty 图片是绘制层，不推光标：发完序列光标仍在原地，图片占 width×height 字符格。
+    # 因此把每行文字用 \e[{n}C 从行首右移到图片右侧即可，无需 \e[6n 查询光标（SSH 会卡）。
+    if getattr(args, "logo_image", None):
+        img_seq, img_h = kitty_image_escape(args.logo_image, width=args.logo_image_width)
+        if img_seq:
+            img_w = args.logo_image_width
+            text_lines = []
+            if cfg.get("title"):
+                text_lines.append(pal.bold + pal.key(cfg["title"]) + pal.reset)
+            cur = None
+            for label, val, pct in rows:
+                if label.startswith("__GROUP__"):
+                    cur = label.split("__GROUP__", 1)[1]
+                    text_lines.append(pal.group_key(cur, "✦ ") + pal.group_key(cur, cur))
+                else:
+                    label_str = pal.group_key(cur, label) + pal.sep()
+                    rendered = pal.bar(pct) if (args.bars and pct is not None) else pal.val(val)
+                    text_lines.append(indent + label_str + rendered)
+            # 宽度：优先问终端真实列数（\e[0n 不适用，用 get_terminal_size）；
+            # 分屏/SSH 下拿到假值(<=0)时才退回到图片+文字的估算宽度。
+            try:
+                cols = shutil.get_terminal_size(fallback=(0, 24)).columns
+            except Exception:
+                cols = 0
+            gap = 2  # 图片与文字间距，收紧到 2 列给文字多留空间
+            text_col = img_w + gap  # 文字起始列（0-based）
+            # 有真实列数就截到窗口边界，防长行溢出被硬裁；拿不到就不截。
+            avail = (cols - text_col - 1) if cols > text_col + 8 else 10**6
+            shift = f"\033[{text_col + 1}G"  # 绝对列定位（不用 C，避免累加）
+            # 照 fastfetch image.c 完整流程：
+            #   1) 清屏+归位左上角  2) 画图片  3) \e[H 归位（kitty 画完图光标会下移！）
+            # 漏掉第 3 步，文字会从图片底部写起、撑屏滚动，把图的脸滚出去（只剩裙子）。
+            out = "\033[2J\033[3J\033[H" + img_seq + "\033[H"
+            for i, t in enumerate(text_lines):
+                if i:
+                    out += "\033[1G\n"  # 换行后强制回车到行首，防列累加
+                tt = t if (args.no_trim or avail >= 10**6) else trim_visible(t, avail)
+                out += shift + tt.rstrip()
+            return out
+
+    logo = LOGOS.get(args.logo, []) if args.logo != "off" else []
+    logo_w = max((len(l) for l in logo), default=0)
+
+    # 终端宽度（SSH / 管道下 get_terminal_size 会 fallback 到 80）
+    try:
+        cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    except Exception:
+        cols = 80
+
+    # 先把文字行拼好（未截断），用于测量自然宽度并给两种布局复用
+    text_rows = []
+    current_group = None
+    for label, val, pct in rows:
+        if label.startswith("__GROUP__"):
+            gname = label.split("__GROUP__", 1)[1]
+            current_group = gname
+            # 组标题和字段 key 都按组色上色（普通主题无组色配置时回退到 accent）
+            text_rows.append(f"{pal.group_key(gname, '✦')} {pal.group_key(gname, gname)}")
+        else:
+            label_str = pal.group_key(current_group, label) + pal.sep()
+            rendered = pal.bar(pct) if (args.bars and pct is not None) else pal.val(val)
+            text_rows.append(indent + label_str + rendered)
+    text_w = max((visible_len(t) for t in text_rows), default=20)
+
+    # logo 位置：照 fastfetch 的 --logo-position auto —— 窄到并排放不下就把 logo 挪到顶部
+    position = getattr(args, "logo_position", "auto")
+    if position == "auto":
+        position = "top" if (logo and logo_w + 3 + text_w > cols) else "left"
+
+    title_lines = []
+    if cfg.get("title"):
+        title_lines.append(pal.bold + pal.key(cfg["title"]) + pal.reset)
+        if cfg.get("subtitle"):
+            title_lines.append(pal.dim + cfg["subtitle"] + pal.reset)
+
+    out_lines = []
+    if position == "top" and logo:
+        # 顶部布局：logo 独占上方，文字用整行宽度（省略号更少）
+        out_lines.extend(pal.logo(l.rstrip()) for l in logo)
+        if title_lines:
+            out_lines.append("")
+            out_lines.extend(indent + t for t in title_lines)
+        if text_rows:
+            out_lines.append("")
+        for text in text_rows:
+            out_lines.append((text if args.no_trim else trim_visible(text, cols)).rstrip())
+    else:
+        # 并排布局：文字截断到终端剩余宽度，防止回绕压到 logo 上
+        avail = max(cols - logo_w - 3, 24) if logo else max(cols, 24)
+        title_pad = (" " * (logo_w + 3)) if logo else indent
+        for t in title_lines:
+            out_lines.append(title_pad + t)
+        if title_lines:
+            out_lines.append("")
+        nlines = max(len(text_rows), len(logo))
+        for i in range(nlines):
+            if i < len(logo):
+                logo_part = pal.logo(logo[i].rstrip())
+            else:
+                logo_part = " " * logo_w
+            text = text_rows[i] if i < len(text_rows) else ""
+            if text and not args.no_trim:
+                text = trim_visible(text, avail)
+            out_lines.append(f"{logo_part}   {text}".rstrip())
+    return "\n".join(out_lines)
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def load_config(path):
+    """-c 既可接预设名，也可接 JSON 配置文件路径（同 fastfetch）。"""
+    if path in PRESETS:
+        cfg = json.loads(json.dumps(PRESETS[path]))  # deep copy
+        cfg["_preset"] = path
+        return cfg
+    cfg = dict(groups=DEFAULT_GROUPS)
+    if path:
+        p = Path(os.path.expanduser(path))
+        if p.exists():
+            try:
+                cfg.update(json.loads(p.read_text(encoding="utf-8")))
+            except Exception as e:
+                print(f"config error: {e}", file=sys.stderr)
+        else:
+            print(f"config not found: {path}", file=sys.stderr)
+    return cfg
+
+def main():
+    ap = argparse.ArgumentParser(description="nagisafetch — 零依赖系统信息工具")
+    ap.add_argument("--version", action="version", version=f"nagisafetch {__version__}")
+    ap.add_argument("-c", "--config", default="default",
+                    help="预设名 (default|minimal|all) 或 JSON 配置文件路径；默认 default")
+    ap.add_argument("--theme", choices=list(THEMES), default="arch")
+    ap.add_argument("--logo", default=None, help="logo 名或 off；默认自动检测")
+    ap.add_argument("--logo-image", metavar="PNG",
+                    help="用 kitty graphics 显示 PNG 图片 logo（数据直传，SSH 可用；需 kitty 终端）")
+    ap.add_argument("--logo-image-width", type=int, default=40,
+                    help="图片 logo 字符宽度，默认 40（高度按比例推算）")
+    ap.add_argument("--logo-position", choices=("auto", "left", "top"), default="auto",
+                    help="auto 按终端宽度自适应（窄屏 logo 挪到顶部），left/top 强制")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--style", choices=("grouped", "classic"), default=None,
+                    help="排版风格；默认跟随预设")
+    ap.add_argument("--bars", choices=("on", "off"), default="off")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="不按终端宽度截断长字段（默认截断，防止回绕压 logo）")
+    ap.add_argument("--field", nargs="+", metavar="KEY",
+                    help="只显示指定字段（覆盖预设的字段列表）")
+    ap.add_argument("--title", help="覆盖标语")
+    ap.add_argument("--list-presets", action="store_true")
+    ap.add_argument("--list-themes", action="store_true")
+    ap.add_argument("--list-fields", action="store_true")
+    # 默认参数文件：~/.config/nagisafetch/default-args 里写命令行参数（shell 风格，支持引号）。
+    # 前置到 argv，用户显式参数在后会覆盖。文件不存在则无影响（AstrBot/Termux 不受牵连）。
+    # 兼容旧路径 ~/.config/sysfetch/default-args（老用户升级不丢配置）。
+    defaults_path = None
+    for _cand in ("~/.config/nagisafetch/default-args", "~/.config/sysfetch/default-args"):
+        _p = Path(os.path.expanduser(_cand))
+        if _p.is_file():
+            defaults_path = _p
+            break
+    try:
+        if defaults_path is not None:
+            extra = shlex.split(defaults_path.read_text())
+            sys.argv = [sys.argv[0]] + extra + sys.argv[1:]
+    except Exception as e:
+        print(f"default-args 读取失败，忽略: {e}", file=sys.stderr)
+    args = ap.parse_args()
+
+    if args.list_presets:
+        print("available presets:", ", ".join(PRESETS))
+        return
+    if args.list_themes:
+        print("available themes:", ", ".join(THEMES))
+        return
+    if args.list_fields:
+        print("available fields:", ", ".join(sorted(FIELDS)))
+        return
+
+    cfg = load_config(args.config)
+    # --field 覆盖：切到 classic 风格，只渲染指定字段
+    if args.field:
+        bad = [k for k in args.field if k not in FIELDS]
+        if bad:
+            print(f"unknown field(s): {', '.join(bad)}", file=sys.stderr)
+        cfg["fields"] = [k for k in args.field if k in FIELDS]
+        cfg.pop("groups", None)
+        args.style = "classic"
+    if args.style is None:
+        args.style = cfg.get("style", "grouped")
+    if args.title:
+        cfg["title"] = args.title
+    if args.logo is None:
+        args.logo = detect_logo()
+    if args.logo != "off" and args.logo not in LOGOS:
+        print(f"unknown logo: {args.logo} (可用: off, {', '.join(LOGOS)})", file=sys.stderr)
+        args.logo = "off"
+    # 图片 logo 校验：显式指定但读不到就报错并退回 ASCII
+    if args.logo_image:
+        img_seq, _ = kitty_image_escape(args.logo_image, width=args.logo_image_width)
+        if img_seq is None:
+            # 文件不存在 / 是 JPEG / 非 PNG：给出明确提示后退回 ASCII
+            try:
+                with open(os.path.expanduser(args.logo_image), "rb") as _fh:
+                    if _fh.read(3) == b"\xff\xd8\xff":
+                        print("logo-image: 是 JPEG——kitty 数据直传只支持 PNG，请先转成 PNG"
+                              "（如 magick in.jpg out.png）", file=sys.stderr)
+                    else:
+                        print(f"logo-image: 不是有效 PNG: {args.logo_image}（退回 ASCII）",
+                              file=sys.stderr)
+            except OSError:
+                print(f"logo-image: 读不到文件: {args.logo_image}（退回 ASCII）",
+                      file=sys.stderr)
+            args.logo_image = None
+    args.bars = args.bars == "on"
+
+    accent = (0, 0, 0) if args.no_color else THEMES[args.theme]
+    group_colors = {} if args.no_color else GROUP_THEMES.get(args.theme, {})
+    pal = Palette(accent, group_colors)
+    if args.no_color:
+        pal.key = lambda s: s
+        pal.group_key = lambda g, s: s
+        pal.logo = lambda s: s
+        pal.sep = lambda s=": ": s
+        pal.bold = pal.dim = pal.reset = ""
+        pal.bar = lambda pct, width=10: f"{pct:.0f}%"
+
+    global pal_reset_cache
+    pal_reset_cache = pal.reset
+    print(render(cfg, args, pal))
+
+if __name__ == "__main__":
+    main()
