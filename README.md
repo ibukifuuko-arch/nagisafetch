@@ -50,7 +50,7 @@ yay -S nagisafetch
 需要 Python 3.8+：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/main/nagisafetch \
+curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/nagisafetch \
   -o ~/.local/bin/nagisafetch
 chmod +x ~/.local/bin/nagisafetch
 ```
