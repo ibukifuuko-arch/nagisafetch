@@ -33,8 +33,8 @@
 - 预设照着 fastfetch 做。`-c default|minimal|all|sora`，`-c all` 把所有字段都列出来。
 - 7 套主题。arch、nord、dracula、gruvbox、kanagawa、rose 是单色，sora 是分组四色。
 - 自动检测。发行版、WM 这些从 `/etc/os-release`、`/proc`、`gsettings` 和你自己的 rice 配置里读，读不到就跳过这一项。
-- Termux 上也能跑。它会认出 Termux，IP 用 UDP 法拿，电池从 Binder 读，Android 封掉的 `/proc` 路径绕开。
-- 图片 logo 用 `--logo-image` 传 PNG，走 kitty graphics 协议，SSH 里也能显示。
+- Termux 上也能跑。它会认出 Termux
+- 图片 logo 用 `--logo-image` 传 PNG，走 kitty graphics 协议
 - 窗口窄的时候 logo 自动挪到顶上，不跟文字挤一块。
 
 ## 安装
