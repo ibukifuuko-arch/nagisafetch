@@ -18,8 +18,9 @@ else
 fi
 
 # 判断安装位置：Termux 装到 $PREFIX/bin，普通 Linux 装到 ~/.local/bin
-if [ -d "/data/data/com.termux" ] || [ -n "${TERMUX_VERSION:-}" ]; then
-    DEST="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+# 同时校验 TERMUX_VERSION 和 $PREFIX 路径，避免普通 Linux 上的同名残留目录误判
+if [ -n "${TERMUX_VERSION:-}" ] && [ "${PREFIX:-}" = "/data/data/com.termux/files/usr" ]; then
+    DEST="${PREFIX}/bin"
     PLATFORM="Termux"
 else
     DEST="${XDG_BIN_HOME:-${HOME}/.local/bin}"
