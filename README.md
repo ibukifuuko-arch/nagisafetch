@@ -33,8 +33,8 @@
 - **预设机制**（照 fastfetch）：`-c default|minimal|all|sora`，`-c all` 列出全部字段
 - **主题系统**：单色（arch/nord/dracula/gruvbox/kanagawa/rose）+ 分组四色（sora）
 - **自动检测**：不写死发行版/WM，从 `/etc/os-release`、`/proc`、`gsettings`、rice 配置里读
-- **Termux/Android 适配**：自动识别 Termux，走 UDP 法拿 IP、Binder 拿电池、避开被封的 `/proc`
-- **kitty 图片 logo**：`--logo-image` 用 kitty graphics 协议直传 PNG（SSH 下也能用）
+- **Termux/Android 适配**：自动识别 Termux
+- **kitty 图片 logo**：`--logo-image` 用 kitty graphics 协议直传 PNG
 - **终端宽度自适应**：窄屏自动把 logo 挪到顶部，避免挤压文字
 
 ## 安装
