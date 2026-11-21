@@ -23,7 +23,7 @@ Themes:
   分组: sora（硬件绿·软件黄·桌面蓝·时间品红，来自 s0raLin/fastfetch-config）
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import argparse
 import base64
@@ -299,6 +299,23 @@ def kitty_image_escape(path, width=40, height=None, align="left"):
     if height:
         head += f",r={height}"
     return head + ";" + b64 + "\033\\", 0
+
+def kitty_graphics_ok():
+    """当前终端是否支持 kitty graphics 协议（决定 --logo-image 能否显示）。
+
+    只有 kitty 系终端能解码 \033_G 序列；xterm/Konsole/Windows Terminal 收到
+    会直接丢弃，但配套的清屏+右移定位照常生效，结果是「图没了、logo 也没了、
+    文字还被推到右边」。所以图片模式下必须先确认终端支持，否则退回 ASCII。
+    SSH 到 kitty 时 KITTY_WINDOW_ID 不透传，但 TERM 会保留 xterm-kitty；
+    WezTerm 也实现了同款协议。
+    """
+    if os.environ.get("KITTY_WINDOW_ID") or os.environ.get("KITTY_LISTEN_ON"):
+        return True
+    if os.environ.get("TERM", "").startswith("xterm-kitty"):
+        return True
+    if os.environ.get("TERM_PROGRAM", "").lower() == "wezterm":
+        return True
+    return False
 
 def detect_logo():
     """按 /etc/os-release 猜一个 logo；Termux 下用 android。"""
@@ -1241,10 +1258,16 @@ def main():
     if args.logo != "off" and args.logo not in LOGOS:
         print(f"unknown logo: {args.logo} (可用: off, {', '.join(LOGOS)})", file=sys.stderr)
         args.logo = "off"
-    # 图片 logo 校验：显式指定但读不到就报错并退回 ASCII
+    # 图片 logo 校验：终端不支持 kitty 协议 / 文件读不到，都退回 ASCII。
+    # 必须先查终端——否则非 kitty 终端收到 \033_G 直接丢弃、但清屏和右移照做，
+    # 结果是图没画出来、ASCII logo 也被跳过、文字还被推到右边，等于整个 logo 没了。
     if args.logo_image:
-        img_seq, _ = kitty_image_escape(args.logo_image, width=args.logo_image_width)
-        if img_seq is None:
+        if not kitty_graphics_ok():
+            print("logo-image: 当前终端不支持 kitty 图片协议，退回 ASCII logo"
+                  "（用 kitty/WezTerm 可显示图片）", file=sys.stderr)
+            args.logo_image = None
+        img_seq, _ = kitty_image_escape(args.logo_image, width=args.logo_image_width) if args.logo_image else (None, 0)
+        if img_seq is None and args.logo_image:
             # 文件不存在 / 是 JPEG / 非 PNG：给出明确提示后退回 ASCII
             try:
                 with open(os.path.expanduser(args.logo_image), "rb") as _fh:
