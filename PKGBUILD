@@ -1,6 +1,6 @@
 # Maintainer: 伊吹风子 <fuko@mcpcnav.cn>
 pkgname=nagisafetch
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="Zero-dependency, themeable system information tool written in Python"
 arch=('any')

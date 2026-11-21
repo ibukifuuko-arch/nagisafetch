@@ -23,7 +23,7 @@ Themes:
   分组: sora（硬件绿·软件黄·桌面蓝·时间品红，来自 s0raLin/fastfetch-config）
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import argparse
 import base64
@@ -382,8 +382,9 @@ def f_wm():
     wm_map = {
         "Hyprland": "Hyprland", "hyprland": "Hyprland",
         "niri": "niri", "sway": "sway", "i3": "i3", "bspwm": "bspwm",
-        "kwin_wayland": "KDE Plasma", "gnome-shell": "GNOME",
-        "xfwm4": "XFCE", "mutter": "GNOME", "labwc": "labwc",
+        "kwin_wayland": "KWin", "kwin_x11": "KWin",
+        "gnome-shell": "GNOME Shell",
+        "xfwm4": "XFWM4", "mutter": "Mutter", "labwc": "labwc",
     }
     try:
         out = subprocess.run(["ps", "-eo", "comm="], capture_output=True,
@@ -878,9 +879,28 @@ def f_temp():
     return f"{best[0]}: {best[1]:.0f}°C", None
 
 def f_de():
-    """桌面环境（XDG_CURRENT_DESKTOP），没有就跳过。"""
+    """桌面环境：优先 XDG_CURRENT_DESKTOP（图形会话里最准），
+    SSH/TTY 下该变量为空，退而从运行中的进程判断（和 f_wm 同一套思路）。"""
     v = os.environ.get("XDG_CURRENT_DESKTOP")
-    return (v or None), None
+    if v:
+        return v, None
+    # 兜底：从进程反推 DE（取第一个匹配，避免 GNOME Shell 等把 mutter 也算进去）
+    de_map = {
+        "plasmashell": "KDE", "kwin_wayland": "KDE",
+        "gnome-shell": "GNOME", "xfce4-session": "XFCE",
+        "lxqt-session": "LXQt", "mate-session": "MATE",
+        "cinnamon": "Cinnamon", "budgie-daemon": "Budgie",
+    }
+    try:
+        out = subprocess.run(["ps", "-eo", "comm="], capture_output=True,
+                             text=True, timeout=3).stdout.splitlines()
+        procs = {p.strip() for p in out}
+        for proc, name in de_map.items():
+            if proc in procs:
+                return name, None
+    except Exception:
+        pass
+    return None, None
 
 def f_init():
     """Init 系统（从 PID 1 的 comm 猜）。"""
