@@ -68,13 +68,27 @@ chmod +x ~/.local/bin/nagisafetch
 
 ### Windows 10/11
 
-系统里有 Python 3.8+ 就行（winget 装的、或绿色版解压的都可以）。把本仓库的 `nagisafetch` 和 `install.ps1` 放同一个目录，PowerShell 里执行：
+系统里有 Python 3.8+ 就行（winget 装的、或绿色版解压的都可以）。
+
+**国内网络推荐 CNB 源**（GitHub 有时连不上），在 PowerShell 里贴一行：
+
+```powershell
+irm https://cnb.cool/ibukifuuko/nagisafetch/-/git/raw/master/install-cn.ps1 | iex
+```
+
+它会直接从 CNB 下载脚本再安装，不用你先手动拿文件。想看明文也可以存下来再跑：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-cn.ps1
+```
+
+能访问 GitHub 的话，原始方式的 `install.ps1` 一样能用——但要先把本仓库的 `nagisafetch` 和 `install.ps1` 放同一个目录：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-脚本会找 Python → 装到 `%LOCALAPPDATA%\nagisafetch\` → 建 `nagisafetch.cmd` 启动器 → 把目录加进用户 PATH → 写默认参数 → 自动验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
+脚本都会找 Python → 装到 `%LOCALAPPDATA%\nagisafetch\` → 建 `nagisafetch.cmd` 启动器 → 把目录加进用户 PATH → 写默认参数 → 自动验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
 
 winget 在无人值守 SSH 会话里会卡住，那种情况建议用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/)解压，把 `python.exe` 的完整路径交给脚本。Windows 版完全不冷启 PowerShell，真机整体约 1.5 秒。细节见 [Windows 注意事项](#windows-注意事项)。
 
