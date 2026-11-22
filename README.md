@@ -82,7 +82,7 @@ irm https://cnb.cool/ibukifuuko/nagisafetch/-/git/raw/master/install-cn.ps1 | ie
 powershell -ExecutionPolicy Bypass -File .\install-cn.ps1
 ```
 
-能访问 GitHub 的话，原始方式的 `install.ps1` 一样能用——但要先把本仓库的 `nagisafetch` 和 `install.ps1` 放同一个目录：
+能访问 GitHub 的话，原始方式的 `install.ps1` 一样能用。只是要先把本仓库的 `nagisafetch` 和 `install.ps1` 放到同一个目录：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -90,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 脚本都会找 Python → 装到 `%LOCALAPPDATA%\nagisafetch\` → 建 `nagisafetch.cmd` 启动器 → 把目录加进用户 PATH → 写默认参数 → 自动验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
 
-不想动系统、或 winget 装不了的话，用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/) 解压也能装——把 `python.exe` 的完整路径交给脚本即可。细节见 [Windows 注意事项](#windows-注意事项)。
+不想动系统、或 winget 装不了的话，用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/) 解压也能装，把 `python.exe` 的完整路径交给脚本就行。细节见 [Windows 注意事项](#windows-注意事项)。
 
 ## 用法
 

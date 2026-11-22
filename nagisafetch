@@ -34,7 +34,6 @@ import re
 import shlex
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import time
@@ -280,13 +279,14 @@ if IS_WIN:
         """所有显示适配器名（注册表，零 PS）。注册表能列出 WMI 看不到的真实独显。"""
         base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
         names = []
+        seen = set()
         for sub in win_reg_subkeys(base):
             if not sub.isdigit():
                 continue
             d = win_reg(base + "\\" + sub, "DriverDesc")
-            if d and d.lower() not in names:
-                names.append(d.lower())
-                names[-1] = d
+            if d and d.lower() not in seen:
+                seen.add(d.lower())
+                names.append(d)
         return names
 
     def win_sysinfo():
@@ -403,10 +403,17 @@ if IS_WIN:
         except Exception:
             return None
 
+    _ifaces_cache = None
+
     def win_ifaces():
-        """[(网卡名, 'ip/前缀长'), ...]。优先 ctypes（零 PS），失败退 WMI。"""
+        """[(网卡名, 'ip/前缀长'), ...]。优先 ctypes（零 PS），失败退 WMI。
+        同一次运行内缓存结果，wf_ip 和 wf_vpn 共用，避免 -c all 下跑两次 ipconfig。"""
+        global _ifaces_cache
+        if _ifaces_cache is not None:
+            return _ifaces_cache
         res = win_adapters()
         if res:
+            _ifaces_cache = res
             return res
         # 兜底：Get-NetIPAddress（冷启 PS ~2s，正常不会走到）
         import csv as _csv, io as _io
@@ -423,6 +430,7 @@ if IS_WIN:
                     res.append((alias, f"{ip}/{plen}"))
         except Exception:
             pass
+        _ifaces_cache = res
         return res
 
     # ---- 字段实现 --------------------------------------------------------
@@ -559,6 +567,9 @@ if IS_WIN:
 
     def wf_up():
         try:
+            # GetTickCount64 返回 64 位毫秒。ctypes 默认 restype 是 c_int（有符号 32 位），
+            # 不显式设置的话，开机超过 2^31 ms（约 24.8 天）会被截成负数，uptime 显示成负值。
+            ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
             up = ctypes.windll.kernel32.GetTickCount64() / 1000.0
             h, rem = divmod(int(up), 3600)
             m, s = divmod(rem, 60)
@@ -627,7 +638,10 @@ if IS_WIN:
         try:
             out = subprocess.run(["netsh", "wlan", "show", "interfaces"],
                                  capture_output=True, timeout=4)
-            text = out.stdout.decode("utf-8", "replace") or out.stdout.decode("gbk", "replace")
+            raw = out.stdout or b""
+            text = raw.decode("utf-8", "replace")
+            if "\ufffd" in text:  # 中文 SSID 在 GBK 终端下 utf-8 会出替换字符，回退重解
+                text = raw.decode("gbk", "replace")
             m = re.search(r"^\s*SSID\s*:\s*(.+)$", text, re.M)
             if m:
                 ssid = m.group(1).strip()
@@ -642,6 +656,7 @@ if IS_WIN:
             ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st))
         except Exception:
             return None, None
+        pct = st.BatteryLifePercent
         # BatteryFlag 的 bit 7 (0x80) = 无电池；pct=255 也是无电池标志。
         # 注意 pct=0 是合法电量（耗尽），不能当无电池跳过。
         if (st.BatteryFlag & 0x80) or pct == 255 or pct > 100:
@@ -848,34 +863,6 @@ WINDOWS_LOGO_RGB = {
     "b": (55, 148, 232),    # 蓝
     "y": (247, 191, 61),    # 黄
 }
-
-def image_dimensions(data):
-    """从 PNG / JPEG 字节里读 (宽, 高)，零依赖。识别不了返回 None。"""
-    # PNG: 签名 + IHDR 块，宽高固定在第 16-24 字节
-    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
-        w, h = struct.unpack(">II", data[16:24])
-        return (w, h) if w and h else None
-    # JPEG: 扫描标记段，找 SOF0/SOF2 里的宽高
-    if len(data) >= 4 and data[:3] == b"\xff\xd8\xff":
-        i, n = 2, len(data)
-        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
-        while i < n - 9:
-            if data[i] != 0xFF:
-                i += 1
-                continue
-            m = data[i + 1]
-            if m == 0x00 or m == 0xFF or 0xD0 <= m <= 0xD9:
-                i += 2
-                continue
-            if i + 4 > n:
-                break
-            seglen = struct.unpack(">H", data[i + 2:i + 4])[0]
-            if m in sof and i + 9 <= n:
-                h, w = struct.unpack(">HH", data[i + 5:i + 9])
-                return (w, h) if w and h else None
-            i += 2 + seglen
-    return None
 
 def kitty_image_escape(path, width=40, height=None, align="left"):
     """用 kitty graphics 协议的 kitty-direct 方式显示图片，照抄 fastfetch image.c:387。
@@ -1093,7 +1080,9 @@ def f_cpu_usage():
     """CPU 实时占用率：读 /proc/stat 两次取 0.3s 差。
     Android/Termux 上 /proc/stat 常被拒，返回 None 让该字段自动跳过。"""
     def _snap():
-        first = read_file("/proc/stat").splitlines()[0] if read_file("/proc/stat") else ""
+        stat = read_file("/proc/stat")
+        lines = stat.splitlines()
+        first = lines[0] if lines else ""
         m = re.match(r"^cpu\s+(.+)", first)
         if not m:
             return None
@@ -1162,7 +1151,8 @@ def f_pkgs():
         n = len(run(["pacman", "-Q"]).splitlines())
         return f"{n} (pacman)", None
     if shutil.which("dpkg"):
-        n = len(run(["dpkg", "-l"]).splitlines())
+        # dpkg -l 开头有 5 行表头，只数 ^ii（已安装）行，避免包数偏大
+        n = len([l for l in run(["dpkg", "-l"]).splitlines() if l.startswith("ii")])
         return f"{n} (dpkg)", None
     return None, None
 
