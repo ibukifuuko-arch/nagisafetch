@@ -90,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 脚本都会找 Python → 装到 `%LOCALAPPDATA%\nagisafetch\` → 建 `nagisafetch.cmd` 启动器 → 把目录加进用户 PATH → 写默认参数 → 自动验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
 
-winget 在无人值守 SSH 会话里会卡住，那种情况建议用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/)解压，把 `python.exe` 的完整路径交给脚本。Windows 版完全不冷启 PowerShell，真机整体约 1.5 秒。细节见 [Windows 注意事项](#windows-注意事项)。
+不想动系统、或 winget 装不了的话，用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/) 解压也能装——把 `python.exe` 的完整路径交给脚本即可。细节见 [Windows 注意事项](#windows-注意事项)。
 
 ## 用法
 
