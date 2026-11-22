@@ -2,7 +2,7 @@
 
 查系统信息的小工具。纯 Python 标准库写的，一个依赖都不用装。Linux / Termux / Windows 三端共用同一份脚本，Windows 下自动切到原生适配层。
 
-布局这套是从 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 那儿学来的，`-c PRESET` 选预设，检测不到的字段直接跳过，不写死某个发行版或桌面环境。31 个字段、7 套主题、6 个 ASCII logo，也能贴一张 PNG 当 logo（走 kitty 图片协议）。
+布局这套是从 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 那儿学来的，`-c PRESET` 选预设，检测不到的字段直接跳过，不写死某个发行版或桌面环境。31 个字段、7 套主题、6 个 ASCII logo，也能贴一张 PNG 当 logo（kitty / ansi / sixel 三种图片协议）。
 
 ```
 ✦ hardware
@@ -29,12 +29,11 @@
 
 ## 它能干什么
 
-- 零依赖，Python 3 标准库就够，pip 包一个不用装。
 - 预设照着 fastfetch 做。`-c default|minimal|all|sora`，`-c all` 把所有字段都列出来。
 - 7 套主题。arch、nord、dracula、gruvbox、kanagawa、rose 是单色，sora 是分组四色。
-- 自动检测。发行版、WM 这些从 `/etc/os-release`、`/proc`、`gsettings` 和你自己的 rice 配置里读，读不到就跳过这一项。
-- Termux 上也能跑。它会认出 Termux
-- 图片 logo 用 `--logo-image` 传 PNG，走 kitty graphics 协议
+- 自动检测发行版、WM 等，读不到就跳过这一项。
+- Termux 上也能跑。
+- 图片 logo 用 `--logo-image` 传 PNG，支持 kitty graphics、ansi 真彩半块、Sixel 三种协议；Windows Terminal 与 SSH 走 ansi，抗重绘不崩坏
 - 窗口窄的时候 logo 自动挪到顶上，不跟文字挤一块。
 
 ## 安装
@@ -43,7 +42,7 @@ Python 3.8 以上。
 
 ### Linux / Termux
 
-跑一键脚本，它会认出系统是普通 Linux 还是 Termux，装到对应的目录（`~/.local/bin` 或 `$PREFIX/bin`），装完顺手验证一下。**国内网络推荐 CNB 源**（GitHub 有时连不上）：
+跑一键脚本，自动装好并验证。**国内网络推荐 CNB 源**（GitHub 有时连不上）：
 
 ```bash
 curl -fsSL https://cnb.cool/ibukifuuko/nagisafetch/-/git/raw/master/install-cn.sh | bash
@@ -88,9 +87,9 @@ powershell -ExecutionPolicy Bypass -File .\install-cn.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-脚本都会找 Python → 装到 `%LOCALAPPDATA%\nagisafetch\` → 建 `nagisafetch.cmd` 启动器 → 把目录加进用户 PATH → 写默认参数 → 自动验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
+脚本会自动找 Python、安装、加进 PATH 并验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
 
-不想动系统、或 winget 装不了的话，用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/) 解压也能装，把 `python.exe` 的完整路径交给脚本就行。细节见 [Windows 注意事项](#windows-注意事项)。
+不想动系统、或 winget 装不了的话，用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/) 解压也能装，把 `python.exe` 的完整路径交给脚本就行。
 
 ## 用法
 
@@ -108,13 +107,26 @@ nagisafetch --list-fields        # 列出所有可用字段
 
 完整参数看 `nagisafetch --help`。
 
-### 图片 logo（kitty）
+### 图片 logo（kitty / ansi / sixel）
 
 ```bash
+# kitty / WezTerm：自动识别，走 kitty graphics 协议
 nagisafetch --logo-image ~/wallpaper.png --logo-image-width 22
+
+# Windows Terminal（含 SSH 到 Windows）：默认走 ansi 真彩半块
+nagisafetch --logo-protocol ansi --logo-image ~/wallpaper.png --logo-image-width 22
 ```
 
-只收 PNG，kitty 数据直传；JPEG 得先转一下。终端要支持 kitty graphics 协议，kitty 自己就行。
+只收 PNG，JPEG 得先转一下。`--logo-protocol` 四个值：
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | kitty 终端用 kitty，其余一律用 ansi 真彩半块 |
+| `kitty` | 强制 kitty graphics，终端不支持就退回 ASCII |
+| `ansi` | 真彩半块字符画图片，Windows Terminal / SSH 最稳，不会崩坏 |
+| `sixel` | 强制 Sixel，画质高但兼容性差，慎选 |
+
+kitty 用于 kitty/WezTerm；Windows Terminal 和 SSH 用 ansi——它是普通文本，滚动、重绘都不丢图；sixel 画质高但兼容性差。图片宽度用 `--logo-image-width` 调。
 
 ### 默认参数文件
 
@@ -124,7 +136,7 @@ nagisafetch --logo-image ~/wallpaper.png --logo-image-width 22
 -c sora --theme rose --logo-image ~/.config/nagisafetch/logo.png --logo-image-width 22
 ```
 
-命令行里显式传的参数会盖掉文件里的同名参数。老路径 `~/.config/sysfetch/default-args` 也认。
+命令行里显式传的参数会盖掉文件里的同名参数。
 
 ## 主题与预设
 
@@ -153,15 +165,15 @@ nagisafetch --logo-image ~/wallpaper.png --logo-image-width 22
 
 - Linux：完整支持，Arch、Fedora、Debian 这些主流发行版都没问题
 - Android (Termux)：适配过，温度、进程、`/proc/stat` 这几项受 Android 权限限制，读不到就自动跳过
-- Windows 10/11：原生支持。走 `winreg` + `ctypes` + `ipconfig`/`tasklist`，不依赖 `/proc`，也不用 WSL。字段用注册表枚举 GPU，能列出 WMI 看不到的真实独显
+- Windows 10/11：原生支持，不用 WSL。
 
 ## Windows 注意事项
 
-- 字段走注册表和独立小命令，不冷启 PowerShell（单次冷启约 2 秒，是早期慢的根源）。真机实测约 1.5 秒，其中 CPU Usage 采样占 0.6 秒。
+- 启动快，不冷启 PowerShell。
 - 台式机没电池时 `Battery` 字段自动跳过，不会显示 `-1%`。
-- 温度默认跳过（WMI thermal zone 台式机多数读不到）；要开启设 `NF_WIN_WMI_TEMP=1`，代价约 2 秒。
-- Windows Terminal 不支持 kitty 图片协议，`--logo-image` 会自动退回 ASCII。想要图片 logo 得在 kitty / WezTerm 里跑。
-- 输出编码强制 UTF-8，`█ ✦ °` 不会乱码；字体建议 Nerd Font（如 JetBrainsMono NFM）。
+- 温度默认跳过，设 `NF_WIN_WMI_TEMP=1` 可开启。
+- Windows Terminal 不支持 kitty 图片协议；图片 logo 用 `--logo-protocol ansi --logo-image xxx.png`，ansi 真彩半块是普通文本，滚动和窗口重绘都不丢图（SSH 到本机跑也一样，不要求本地有该文件）。`auto` 默认就走 ansi。Sixel 虽支持但多图层在 WT 上易崩坏，不推荐。
+- 字体建议 Nerd Font（如 JetBrainsMono NFM）。
 - 默认参数文件除了 `~\.config\nagisafetch\default-args`，也认 `%APPDATA%\nagisafetch\default-args`。
 
 ## License

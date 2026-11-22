@@ -8,9 +8,12 @@ Usage:
   nagisafetch [-c PRESET] [--theme NAME] [--logo NAME|off] [--no-color]
               [--style grouped|classic] [--bars on|off] [--field KEY ...]
               [--logo-position auto|left|top] [--title TITLE]
+              [--logo-image PNG] [--logo-protocol auto|kitty|sixel|ansi]
               [--list-presets] [--list-themes] [--list-fields]
 
   --logo-position auto 按终端宽度自适应：窄终端把 logo 挪到顶部，宽终端并排（默认）
+  --logo-protocol      图片协议：auto 自动；ansi 用真彩半块字符(WT/SSH 最稳)；
+                       kitty 需 kitty/WezTerm；sixel 画质好但兼容性差
 
 Presets:
   default   常用字段（默认）
@@ -35,8 +38,11 @@ import shlex
 import shutil
 import socket
 import subprocess
+import struct
 import sys
 import time
+import zlib
+from collections import Counter
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -864,6 +870,267 @@ WINDOWS_LOGO_RGB = {
     "y": (247, 191, 61),    # 黄
 }
 
+# --------------------------------------------------------------------------
+# Sixel 图片协议：纯标准库 PNG 解码 + Sixel 编码。
+# 与 kitty 的 t=f（让终端读本地路径）不同，Sixel 是把像素编码进数据流直传，
+# SSH 到 Windows/cmd 时本地 Windows Terminal 能直接显示，无需本地存在该文件。
+# --------------------------------------------------------------------------
+
+def _png_decode(data):
+    """解码 PNG 为 (w, h, pixels)，pixels=[[(r,g,b,a),...],...]。
+    支持 color type 0/2/3/4/6、bit depth 1/2/4/8/16、非隔行；失败返回 None。
+    """
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos, idat, plte, trns, ihdr = 8, bytearray(), None, None, None
+    while pos + 8 <= len(data):
+        ln = struct.unpack(">I", data[pos:pos + 4])[0]
+        typ = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + ln]
+        pos += 12 + ln
+        if typ == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", chunk)
+        elif typ == b"PLTE":
+            plte = chunk
+        elif typ == b"tRNS":
+            trns = chunk
+        elif typ == b"IDAT":
+            idat.extend(chunk)
+        elif typ == b"IEND":
+            break
+    if not ihdr:
+        return None
+    w, h, bd, ct, comp, filt, inter = ihdr
+    if inter != 0 or bd not in (1, 2, 4, 8, 16):
+        return None
+    ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ct)
+    if ch is None or (ct == 3 and plte is None):
+        return None
+    if bd < 8 and ct not in (0, 3):
+        return None
+    try:
+        raw = zlib.decompress(bytes(idat))
+    except zlib.error:
+        return None
+    bpix = ch * bd
+    stride = (w * bpix + 7) // 8
+    bpp = max(1, (bpix + 7) // 8)  # filter 的像素步长（字节）
+    if len(raw) < (stride + 1) * h:
+        return None
+    maxv = (1 << bd) - 1
+    rows, prev, p = [], bytearray(stride), 0
+    for _y in range(h):
+        f = raw[p]; p += 1
+        scan = bytearray(raw[p:p + stride]); p += stride
+        for i in range(stride):
+            a = scan[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            if f == 1:
+                scan[i] = (scan[i] + a) & 255
+            elif f == 2:
+                scan[i] = (scan[i] + b) & 255
+            elif f == 3:
+                scan[i] = (scan[i] + ((a + b) >> 1)) & 255
+            elif f == 4:
+                pp = a + b - c
+                pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                scan[i] = (scan[i] + pr) & 255
+            elif f != 0:
+                return None
+
+        def smp(x, comp):
+            if bd == 16:
+                return scan[(x * ch + comp) * 2]
+            if bd == 8:
+                return scan[x * ch + comp]
+            bitpos = (x * ch + comp) * bd
+            return (scan[bitpos >> 3] >> (8 - bd - (bitpos & 7))) & maxv
+
+        row = []
+        for x in range(w):
+            if ct == 0:
+                g = smp(x, 0) * 255 // maxv
+                a = trns[1] if (trns and len(trns) >= 2 and
+                                smp(x, 0) == int.from_bytes(trns[:2], "big")) else 255
+                row.append((g, g, g, a))
+            elif ct == 2:
+                r, g, b = (smp(x, i) for i in range(3))
+                a = 0 if (trns and len(trns) >= 6 and
+                          r == int.from_bytes(trns[0:2], "big") and
+                          g == int.from_bytes(trns[2:4], "big") and
+                          b == int.from_bytes(trns[4:6], "big")) else 255
+                row.append((r, g, b, a))
+            elif ct == 3:
+                pi = smp(x, 0)
+                if pi * 3 + 2 >= len(plte):
+                    row.append((0, 0, 0, 255)); continue
+                a = trns[pi] if (trns and pi < len(trns)) else 255
+                row.append((plte[pi * 3], plte[pi * 3 + 1], plte[pi * 3 + 2], a))
+            elif ct == 4:
+                g = smp(x, 0)
+                row.append((g, g, g, smp(x, 1)))
+            elif ct == 6:
+                row.append((smp(x, 0), smp(x, 1), smp(x, 2), smp(x, 3)))
+        rows.append(row)
+        prev = scan
+    return w, h, rows
+
+def _img_resize(w, h, rows, tw, th):
+    """区域平均缩放（alpha 加权），缩小大图到终端尺寸。"""
+    out = []
+    for ty in range(th):
+        y0, y1 = ty * h // th, max(ty * h // th + 1, (ty + 1) * h // th)
+        row = []
+        for tx in range(tw):
+            x0, x1 = tx * w // tw, max(tx * w // tw + 1, (tx + 1) * w // tw)
+            sr = sg = sb = sa = 0
+            for yy in range(y0, min(y1, h)):
+                for xx in range(x0, min(x1, w)):
+                    r, g, b, a = rows[yy][xx]
+                    sr += r * a; sg += g * a; sb += b * a; sa += a
+            row.append((sr // sa, sg // sa, sb // sa, sa // ((x1 - x0) * (y1 - y0)))
+                       if sa else (0, 0, 0, 0))
+        out.append(row)
+    return out
+
+def _img_quantize(w, h, rows, max_colors=256):
+    """5-5-5 直方图取高频色 + 最近邻映射；透明像素索引 -1。返回 (palette, idx)。"""
+    hist = Counter()
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = rows[y][x]
+            if a >= 128:
+                hist[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)] += 1
+    top = [k for k, _ in hist.most_common(max_colors)]
+    if not top:
+        return [], [[-1] * w for _ in range(h)]
+    palette = [(((k >> 10) & 31) * 255 // 31, ((k >> 5) & 31) * 255 // 31,
+                (k & 31) * 255 // 31) for k in top]
+    cache = {}
+    def nearest(r, g, b):
+        key = (r >> 3, g >> 3, b >> 3)
+        if key in cache:
+            return cache[key]
+        best, bd = 0, 1 << 60
+        for i, (pr, pg, pb) in enumerate(palette):
+            d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
+            if d < bd:
+                bd, best = d, i
+        cache[key] = best
+        return best
+    idx = [[(-1 if rows[y][x][3] < 128 else nearest(*rows[y][x][:3]))
+            for x in range(w)] for y in range(h)]
+    return palette, idx
+
+def _sixel_encode(w, h, idx, palette):
+    parts = ["#%d;2;%d;%d;%d" % (i, r * 100 // 255, g * 100 // 255, b * 100 // 255)
+             for i, (r, g, b) in enumerate(palette)]
+    cur = None
+    for by in range(0, h, 6):
+        colors = {idx[yy][x] for yy in range(by, min(by + 6, h)) for x in range(w)
+                  if idx[yy][x] >= 0}
+        for color in sorted(colors):
+            if color != cur:
+                parts.append("#%d" % color)
+                cur = color
+            chars = []
+            for x in range(w):
+                mask = 0
+                for dy in range(6):
+                    yy = by + dy
+                    if yy < h and idx[yy][x] == color:
+                        mask |= 1 << dy
+                chars.append(chr(63 + mask))  # sixel 字符 = 0x3F + 6bit 掩码
+            s, buf, i = "".join(chars), [], 0
+            while i < len(s):  # !N 行程编码；N 上限 255，超出要分段
+                j = i + 1
+                while j < len(s) and s[j] == s[i] and j - i < 255:
+                    j += 1
+                n = j - i
+                buf.append("!" + str(n) + s[i] if n >= 2 else s[i])
+                i = j
+            parts.append("".join(buf))
+            # 回到本 band 起点：用 CR 而非一堆 BS。Windows Terminal 对 DCS 内的
+            # \x08 处理与 xterm 不一致（退过头会回绕到上一 band 末尾），导致多
+            # 颜色图层错位、图像崩坏；CR 明确置列 0，兼容性好。
+            parts.append("\r")
+        parts.append("$")  # 进到下一 band
+    return "".join(parts)
+
+def sixel_image_escape(path, width=40, px_per_col=10):
+    """把 PNG 编码成 Sixel 数据流。返回 (序列, 占用行数, 占用列数)；失败 (None,0,0)。
+    px_per_col：每个字符列分配的像素数，Windows Terminal 默认字体下 10 较合适。
+    """
+    try:
+        with open(os.path.expanduser(path), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None, 0, 0
+    dec = _png_decode(data)
+    if dec is None:
+        return None, 0, 0
+    w, h, rows = dec
+    pw, ph = max(1, width * px_per_col), 0
+    ph = max(1, round(pw * h / w))
+    rows = _img_resize(w, h, rows, pw, ph)
+    palette, idx = _img_quantize(pw, ph, rows)
+    body = _sixel_encode(pw, ph, idx, palette)
+    # DCS: P0=9 表示 1:1 像素宽高比（0=默认 2:1，竖图会被拉长一倍而崩坏）；
+    #      P1=1 保持透明（像素0不动，避免透明背景被填黑）；P2/P3=像素宽高；ST=\033\\
+    seq = "\033P9;1;%d;%dq" % (pw, ph) + body + "\033\\"
+    return seq, max(1, (ph + 19) // 20), width  # 行高按 cell≈20px 估算
+
+def ansi_halfblock_escape(path, width=40):
+    """把 PNG 编码成 ANSI 真彩半块字符（▀）序列，返回 (文本, 行数, 列数)。
+
+    一个 ▀ 承载 1 列 × 2 行像素：上半用前景色、下半用背景色。输出是普通文本，
+    不依赖 kitty/sixel 图形协议，滚动/窗口重绘/SSH 转发都不会丢失，兼容性最好。
+    透明像素渲染为终端默认前景/背景色，自然融入背景，不会出现黑块。
+    """
+    try:
+        with open(os.path.expanduser(path), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None, 0, 0
+    dec = _png_decode(data)
+    if dec is None:
+        return None, 0, 0
+    w, h, rows = dec
+    pw = max(1, int(width))
+    # 字符单元格约 1:2，故一个字符行对应 2 行像素
+    nrows = max(1, round(pw * h / w / 2))
+    ph = nrows * 2
+    scaled = _img_resize(w, h, rows, pw, ph)
+    lines = []
+    for ty in range(nrows):
+        parts = []
+        last_fg = last_bg = None
+        for tx in range(pw):
+            r1, g1, b1, a1 = scaled[2 * ty][tx]
+            r2, g2, b2, a2 = scaled[2 * ty + 1][tx]
+            fg = (r1, g1, b1) if a1 >= 128 else None
+            bg = (r2, g2, b2) if a2 >= 128 else None
+            if fg != last_fg:
+                parts.append("\033[38;2;%d;%d;%dm" % fg if fg else "\033[39m")
+                last_fg = fg
+            if bg != last_bg:
+                parts.append("\033[48;2;%d;%d;%dm" % bg if bg else "\033[49m")
+                last_bg = bg
+            parts.append("\u2580")  # ▀ upper half block
+        lines.append("".join(parts) + "\033[0m")
+    return "\n".join(lines), nrows, pw
+
+
+def sixel_ok():
+    """当前终端是否可能支持 Sixel。SSH 时服务端环境变量不可靠，返回 True 仅表
+    「值得尝试」，由 --logo-protocol 显式指定来保证；自动模式下只在 Windows 启用。
+    """
+    if os.environ.get("WT_SESSION"):
+        return True
+    return IS_WIN
+
 def kitty_image_escape(path, width=40, height=None, align="left"):
     """用 kitty graphics 协议的 kitty-direct 方式显示图片，照抄 fastfetch image.c:387。
 
@@ -1653,46 +1920,64 @@ def render(cfg, args, pal):
     rows = build_lines(cfg, args, pal)
     indent = "  "
 
-    # 图片 logo（kitty graphics）：并排布局，图片在左、信息在右（fastfetch 风格）。
-    # kitty 图片是绘制层，不推光标：发完序列光标仍在原地，图片占 width×height 字符格。
-    # 因此把每行文字用 \e[{n}C 从行首右移到图片右侧即可，无需 \e[6n 查询光标（SSH 会卡）。
-    if getattr(args, "logo_image", None):
-        img_seq, img_h = kitty_image_escape(args.logo_image, width=args.logo_image_width)
-        if img_seq:
-            img_w = args.logo_image_width
-            text_lines = []
-            if cfg.get("title"):
-                text_lines.append(pal.bold + pal.key(cfg["title"]) + pal.reset)
-            cur = None
-            for label, val, pct in rows:
-                if label.startswith("__GROUP__"):
-                    cur = label.split("__GROUP__", 1)[1]
-                    text_lines.append(pal.group_key(cur, "✦ ") + pal.group_key(cur, cur))
+    # 图片 logo：并排布局，图片在左、信息在右（fastfetch 风格）。
+    # kitty 是绘制层（不推光标）；sixel 画完光标停在图片末尾——两者都在画完后
+    # 用 \e[H 归位，再把每行文字用绝对列定位 \e[{n}G 右移到图片右侧即可，
+    # 无需 \e[6n/\e[16t 查询（SSH 下会卡）。编码结果已在 main 里缓存到 args。
+    img_seq = getattr(args, "_img_seq", None)
+    if img_seq:
+        proto_used = getattr(args, "img_protocol_used", None)
+        img_w = args._img_cols
+        text_lines = []
+        if cfg.get("title"):
+            text_lines.append(pal.bold + pal.key(cfg["title"]) + pal.reset)
+            if cfg.get("subtitle"):
+                text_lines.append(pal.dim + cfg["subtitle"] + pal.reset)
+        cur = None
+        for label, val, pct in rows:
+            if label.startswith("__GROUP__"):
+                cur = label.split("__GROUP__", 1)[1]
+                text_lines.append(pal.group_key(cur, "✦ ") + pal.group_key(cur, cur))
+            else:
+                label_str = pal.group_key(cur, label) + pal.sep()
+                rendered = pal.bar(pct) if (args.bars and pct is not None) else pal.val(val)
+                text_lines.append(indent + label_str + rendered)
+        # 宽度：优先问终端真实列数；分屏/SSH 下拿到假值(<=0)时才退回估算宽度。
+        try:
+            cols = shutil.get_terminal_size(fallback=(0, 24)).columns
+        except Exception:
+            cols = 0
+        gap = 2  # 图片与文字间距，收紧到 2 列给文字多留空间
+        text_col = img_w + gap  # 文字起始列（0-based）
+        avail = (cols - text_col - 1) if cols > text_col + 8 else 10**6
+
+        if proto_used == "ansi":
+            # ansi 真彩半块是普通文本行（带自己的颜色），逐行并排拼接即可。
+            # 不依赖绘制层、不清屏归位，滚动/重绘/SSH 都不会丢图。
+            img_lines = img_seq.split("\n")
+            out_lines = []
+            n = max(len(img_lines), len(text_lines))
+            for i in range(n):
+                left = img_lines[i] if i < len(img_lines) else ""
+                right = text_lines[i] if i < len(text_lines) else ""
+                if right:
+                    tt = right if (args.no_trim or avail >= 10**6) else trim_visible(right, avail)
+                    out_lines.append(left + " " * gap + tt.rstrip())
                 else:
-                    label_str = pal.group_key(cur, label) + pal.sep()
-                    rendered = pal.bar(pct) if (args.bars and pct is not None) else pal.val(val)
-                    text_lines.append(indent + label_str + rendered)
-            # 宽度：优先问终端真实列数（\e[0n 不适用，用 get_terminal_size）；
-            # 分屏/SSH 下拿到假值(<=0)时才退回到图片+文字的估算宽度。
-            try:
-                cols = shutil.get_terminal_size(fallback=(0, 24)).columns
-            except Exception:
-                cols = 0
-            gap = 2  # 图片与文字间距，收紧到 2 列给文字多留空间
-            text_col = img_w + gap  # 文字起始列（0-based）
-            # 有真实列数就截到窗口边界，防长行溢出被硬裁；拿不到就不截。
-            avail = (cols - text_col - 1) if cols > text_col + 8 else 10**6
-            shift = f"\033[{text_col + 1}G"  # 绝对列定位（不用 C，避免累加）
-            # 照 fastfetch image.c 完整流程：
-            #   1) 清屏+归位左上角  2) 画图片  3) \e[H 归位（kitty 画完图光标会下移！）
-            # 漏掉第 3 步，文字会从图片底部写起、撑屏滚动，把图的脸滚出去（只剩裙子）。
-            out = "\033[2J\033[3J\033[H" + img_seq + "\033[H"
-            for i, t in enumerate(text_lines):
-                if i:
-                    out += "\033[1G\n"  # 换行后强制回车到行首，防列累加
-                tt = t if (args.no_trim or avail >= 10**6) else trim_visible(t, avail)
-                out += shift + tt.rstrip()
-            return out
+                    out_lines.append(left.rstrip())
+            return "\n".join(out_lines)
+
+        # kitty / sixel 是绘制层：发序列后用 \e[H 归位，再绝对列定位文字。
+        shift = f"\033[{text_col + 1}G"  # 绝对列定位（不用 C，避免累加）
+        # 1) 清屏+归位左上角  2) 画图片  3) \e[H 归位（画完图光标已移动）
+        # 漏掉第 3 步，文字会从图片底部写起、撑屏滚动，把图滚出去。
+        out = "\033[2J\033[3J\033[H" + img_seq + "\033[H"
+        for i, t in enumerate(text_lines):
+            if i:
+                out += "\033[1G\n"  # 换行后强制回车到行首，防列累加
+            tt = t if (args.no_trim or avail >= 10**6) else trim_visible(t, avail)
+            out += shift + tt.rstrip()
+        return out
 
     # Windows logo 用四色字符层（字符+颜色成对），其余 logo 用单色字符层
     is_color_logo = (args.logo == "windows")
@@ -1804,7 +2089,10 @@ def main():
     ap.add_argument("--theme", choices=list(THEMES), default="arch")
     ap.add_argument("--logo", default=None, help="logo 名或 off；默认自动检测")
     ap.add_argument("--logo-image", metavar="PNG",
-                    help="用 kitty graphics 显示 PNG 图片 logo（数据直传，SSH 可用；需 kitty 终端）")
+                    help="用图片显示 PNG logo（协议由 --logo-protocol 决定）")
+    ap.add_argument("--logo-protocol", choices=("auto", "kitty", "sixel", "ansi"), default="auto",
+                    help="图片协议：auto 自动；ansi 真彩半块字符(Windows Terminal/SSH 最稳，推荐)；"
+                         "sixel 画质高但 WT 上易崩坏；kitty 需 kitty/WezTerm")
     ap.add_argument("--logo-image-width", type=int, default=40,
                     help="图片 logo 字符宽度，默认 40（高度按比例推算）")
     ap.add_argument("--logo-position", choices=("auto", "left", "top"), default="auto",
@@ -1870,29 +2158,60 @@ def main():
     if args.logo != "off" and args.logo not in LOGOS:
         print(f"unknown logo: {args.logo} (可用: off, {', '.join(LOGOS)})", file=sys.stderr)
         args.logo = "off"
-    # 图片 logo 校验：终端不支持 kitty 协议 / 文件读不到，都退回 ASCII。
-    # 必须先查终端——否则非 kitty 终端收到 \033_G 直接丢弃、但清屏和右移照做，
-    # 结果是图没画出来、ASCII logo 也被跳过、文字还被推到右边，等于整个 logo 没了。
+    # 图片 logo 校验与编码：先定协议，再编码成数据流，结果缓存给 render 复用。
+    # 必须先确认终端/编码成功——否则收到不支持的转义序列时，配套的清屏+右移
+    # 照做，结果是图没画出来、ASCII logo 也被跳过，等于整个 logo 都没了。
+    args._img_seq = args._img_rows = args._img_cols = None
     if args.logo_image:
-        if not kitty_graphics_ok():
-            print("logo-image: 当前终端不支持 kitty 图片协议，退回 ASCII logo"
-                  "（用 kitty/WezTerm 可显示图片）", file=sys.stderr)
+        want = args.logo_protocol
+        if want == "auto":
+            # kitty 终端用原生协议（画质最好）；其余一律用 ansi 真彩半块——
+            # 普通文本、抗滚动重绘，Windows Terminal/SSH/大多数终端通吃。
+            # sixel 只在显式指定时启用：WT 的多图层 sixel 兼容性差，不进 auto。
+            if kitty_graphics_ok():
+                proto = "kitty"
+            elif os.environ.get("TERM", "").lower() in ("", "dumb"):
+                proto = None
+            else:
+                proto = "ansi"
+        else:
+            proto = want
+            # 显式 kitty 但终端不支持：给出更具体的提示（下面不重复打通用提示）
+            if want == "kitty" and not kitty_graphics_ok():
+                print("logo-image: 当前终端不支持 kitty 协议（用 kitty/WezTerm 或 "
+                      "--logo-protocol ansi），退回 ASCII logo", file=sys.stderr)
+                proto = "off"
+        if proto is None:
+            print("logo-image: 当前终端无可用图片协议，退回 ASCII logo"
+                  "（可试 --logo-protocol ansi）", file=sys.stderr)
             args.logo_image = None
-        img_seq, _ = kitty_image_escape(args.logo_image, width=args.logo_image_width) if args.logo_image else (None, 0)
-        if img_seq is None and args.logo_image:
-            # 文件不存在 / 是 JPEG / 非 PNG：给出明确提示后退回 ASCII
-            try:
-                with open(os.path.expanduser(args.logo_image), "rb") as _fh:
-                    if _fh.read(3) == b"\xff\xd8\xff":
-                        print("logo-image: 是 JPEG——kitty 数据直传只支持 PNG，请先转成 PNG"
-                              "（如 magick in.jpg out.png）", file=sys.stderr)
-                    else:
-                        print(f"logo-image: 不是有效 PNG: {args.logo_image}（退回 ASCII）",
-                              file=sys.stderr)
-            except OSError:
-                print(f"logo-image: 读不到文件: {args.logo_image}（退回 ASCII）",
-                      file=sys.stderr)
+        elif proto == "off":
             args.logo_image = None
+        else:
+            if proto == "kitty":
+                seq, _ = kitty_image_escape(args.logo_image, width=args.logo_image_width)
+                rows, cols = 0, args.logo_image_width
+            elif proto == "ansi":
+                seq, rows, cols = ansi_halfblock_escape(args.logo_image, width=args.logo_image_width)
+            else:
+                seq, rows, cols = sixel_image_escape(args.logo_image, width=args.logo_image_width)
+            if seq is None:
+                # 文件不存在 / 是 JPEG / 非 PNG：给出明确提示后退回 ASCII
+                try:
+                    with open(os.path.expanduser(args.logo_image), "rb") as _fh:
+                        if _fh.read(3) == b"\xff\xd8\xff":
+                            print("logo-image: 是 JPEG——只支持 PNG，请先转成 PNG"
+                                  "（如 magick in.jpg out.png）", file=sys.stderr)
+                        else:
+                            print(f"logo-image: 不是有效 PNG: {args.logo_image}（退回 ASCII）",
+                                  file=sys.stderr)
+                except OSError:
+                    print(f"logo-image: 读不到文件: {args.logo_image}（退回 ASCII）",
+                          file=sys.stderr)
+                args.logo_image = None
+            else:
+                args.img_protocol_used = proto
+                args._img_seq, args._img_rows, args._img_cols = seq, rows, cols
     args.bars = args.bars == "on"
 
     accent = (0, 0, 0) if args.no_color else THEMES[args.theme]
