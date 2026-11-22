@@ -43,17 +43,23 @@ Python 3.8 以上。
 
 ### Linux / Termux
 
-跑一键脚本，它会认出系统是普通 Linux 还是 Termux，装到对应的目录（`~/.local/bin` 或 `$PREFIX/bin`），装完顺手验证一下：
+跑一键脚本，它会认出系统是普通 Linux 还是 Termux，装到对应的目录（`~/.local/bin` 或 `$PREFIX/bin`），装完顺手验证一下。**国内网络推荐 CNB 源**（GitHub 有时连不上）：
+
+```bash
+curl -fsSL https://cnb.cool/ibukifuuko/nagisafetch/-/git/raw/master/install-cn.sh | bash
+```
+
+能访问 GitHub 的话，用原始源也一样：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/install.sh | bash
 ```
 
-不想跑脚本，手动也行：
+不想跑脚本，手动也行（把链接换成 GitHub 源同样可以）：
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/nagisafetch \
+curl -fsSL https://cnb.cool/ibukifuuko/nagisafetch/-/git/raw/master/nagisafetch \
   -o ~/.local/bin/nagisafetch
 chmod +x ~/.local/bin/nagisafetch
 ```
