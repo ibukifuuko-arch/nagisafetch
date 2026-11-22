@@ -32,12 +32,16 @@ github() {
   git push origin "v$VER" 2>/dev/null || true
   gh release create "v$VER" --title "v$VER" --generate-notes 2>/dev/null || true
 
-  echo "==> 重新算 sha256（PKGBUILD 用）"
+  echo "==> 校对 sha256（PKGBUILD / .SRCINFO 里已填 v$VER 的值）"
   sleep 3
   SUM=$(curl -fsSL "https://github.com/$USER/$REPO/archive/refs/tags/v$VER.tar.gz" | sha256sum | awk '{print $1}')
-  echo "sha256sum: $SUM"
-  echo "把 PKGBUILD 里的 sha256sums=('SKIP') 改成 sha256sums=('$SUM')"
-  echo "然后改 .SRCINFO 里对应的 sha256sums = $SUM"
+  EXPECTED=$(grep -oP "sha256sums=\('\K[^']+" "$DIR/PKGBUILD")
+  echo "源码包 sha256: $SUM"
+  if [ "$SUM" = "$EXPECTED" ]; then
+    echo "与 PKGBUILD 记录一致，AUR 可正常构建。"
+  else
+    echo "注意：与 PKGBUILD 记录（$EXPECTED）不一致，发 AUR 前请更新 PKGBUILD 和 .SRCINFO。"
+  fi
 }
 
 aur() {

@@ -8,7 +8,7 @@ url="https://github.com/ibukifuuko-arch/nagisafetch"
 license=('MIT')
 depends=('python')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/ibukifuuko-arch/nagisafetch/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('58c02073d64bf1abb8e43efaa8d8bf8a8d65d5cc1e58f28b3a222b07c5880508')
 
 package() {
     cd "$srcdir/nagisafetch-$pkgver"
