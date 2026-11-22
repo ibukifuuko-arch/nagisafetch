@@ -7,7 +7,7 @@ set -euo pipefail
 
 USER="ibukifuuko-arch"
 REPO="nagisafetch"
-VER="1.0.2"
+VER="1.0.3"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TAR="/workspace/nagisafetch-release.tar.gz"
 

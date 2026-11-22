@@ -1,6 +1,6 @@
 # nagisafetch
 
-查系统信息的小工具。纯 Python 标准库写的，一个依赖都不用装。
+查系统信息的小工具。纯 Python 标准库写的，一个依赖都不用装。Linux / Termux / Windows 三端共用同一份脚本，Windows 下自动切到原生适配层。
 
 布局这套是从 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 那儿学来的，`-c PRESET` 选预设，检测不到的字段直接跳过，不写死某个发行版或桌面环境。31 个字段、7 套主题、6 个 ASCII logo，也能贴一张 PNG 当 logo（走 kitty 图片协议）。
 
@@ -39,7 +39,11 @@
 
 ## 安装
 
-Python 3.8 以上。跑一键脚本，它会认出系统是普通 Linux 还是 Termux，装到对应的目录（`~/.local/bin` 或 `$PREFIX/bin`），装完顺手验证一下：
+Python 3.8 以上。
+
+### Linux / Termux
+
+跑一键脚本，它会认出系统是普通 Linux 还是 Termux，装到对应的目录（`~/.local/bin` 或 `$PREFIX/bin`），装完顺手验证一下：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ibukifuuko-arch/nagisafetch/master/install.sh | bash
@@ -55,6 +59,18 @@ chmod +x ~/.local/bin/nagisafetch
 ```
 
 记得把 `~/.local/bin` 加进 `PATH`，然后直接敲 `nagisafetch`。
+
+### Windows 10/11
+
+系统里有 Python 3.8+ 就行（winget 装的、或绿色版解压的都可以）。把本仓库的 `nagisafetch` 和 `install.ps1` 放同一个目录，PowerShell 里执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+脚本会找 Python → 装到 `%LOCALAPPDATA%\nagisafetch\` → 建 `nagisafetch.cmd` 启动器 → 把目录加进用户 PATH → 写默认参数 → 自动验证。**重开 Windows Terminal** 后直接敲 `nagisafetch`。
+
+winget 在无人值守 SSH 会话里会卡住，那种情况建议用 [Python 官方绿色版](https://mirrors.huaweicloud.com/python/3.12.10/)解压，把 `python.exe` 的完整路径交给脚本。Windows 版完全不冷启 PowerShell，真机整体约 1.5 秒。细节见 [Windows 注意事项](#windows-注意事项)。
 
 ## 用法
 
@@ -117,7 +133,16 @@ nagisafetch --logo-image ~/wallpaper.png --logo-image-width 22
 
 - Linux：完整支持，Arch、Fedora、Debian 这些主流发行版都没问题
 - Android (Termux)：适配过，温度、进程、`/proc/stat` 这几项受 Android 权限限制，读不到就自动跳过
-- Windows 原生：不支持，它依赖 `/proc`、`/sys`、`/etc/os-release`。WSL 里能用，不过读到的是 WSL 虚拟机自己的信息
+- Windows 10/11：原生支持。走 `winreg` + `ctypes` + `ipconfig`/`tasklist`，不依赖 `/proc`，也不用 WSL。字段用注册表枚举 GPU，能列出 WMI 看不到的真实独显
+
+## Windows 注意事项
+
+- 字段走注册表和独立小命令，不冷启 PowerShell（单次冷启约 2 秒，是早期慢的根源）。真机实测约 1.5 秒，其中 CPU Usage 采样占 0.6 秒。
+- 台式机没电池时 `Battery` 字段自动跳过，不会显示 `-1%`。
+- 温度默认跳过（WMI thermal zone 台式机多数读不到）；要开启设 `NF_WIN_WMI_TEMP=1`，代价约 2 秒。
+- Windows Terminal 不支持 kitty 图片协议，`--logo-image` 会自动退回 ASCII。想要图片 logo 得在 kitty / WezTerm 里跑。
+- 输出编码强制 UTF-8，`█ ✦ °` 不会乱码；字体建议 Nerd Font（如 JetBrainsMono NFM）。
+- 默认参数文件除了 `~\.config\nagisafetch\default-args`，也认 `%APPDATA%\nagisafetch\default-args`。
 
 ## License
 

@@ -23,7 +23,7 @@ Themes:
   分组: sora（硬件绿·软件黄·桌面蓝·时间品红，来自 s0raLin/fastfetch-config）
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 import argparse
 import base64
@@ -39,6 +39,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# --------------------------------------------------------------------------
+# 平台标志
+# --------------------------------------------------------------------------
+IS_WIN = platform.system() == "Windows"
 
 # --------------------------------------------------------------------------
 # ANSI 颜色工具
@@ -73,6 +78,20 @@ class Palette:
         """logo 跟着主题走：整块用 accent 色。"""
         r, g, b = self.accent
         return self.rgb(r, g, b, text)
+
+    def logo_line(self, text, color_row=None):
+        """带颜色层的 logo 行：按 color_row 逐格上色；无颜色层时退回 accent 整块。"""
+        if not color_row:
+            return self.logo(text)
+        out = []
+        for i, ch in enumerate(text):
+            key = color_row[i] if i < len(color_row) else " "
+            if ch == " " or key == " " or key not in WINDOWS_LOGO_RGB:
+                out.append(ch)
+            else:
+                r, g, b = WINDOWS_LOGO_RGB[key]
+                out.append(self.rgb(r, g, b, ch))
+        return "".join(out)
 
     def sep(self, text=": "):
         return self.dim + text + self.reset
@@ -170,6 +189,538 @@ def getprop(key):
     return ""
 
 # --------------------------------------------------------------------------
+# Windows 适配层：纯标准库（ctypes / winreg / PowerShell），零第三方依赖。
+# 每个字段一个 wf_* 函数，返回 (value, pct)，检测不到返回 (None, None)。
+# Linux / Termux 完全不进入这一层，原逻辑一行未改。
+# --------------------------------------------------------------------------
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+
+    def win_ps(script, timeout=8):
+        """调 PowerShell -NoProfile 执行脚本，返回 stdout；失败返回 ''。"""
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return out.stdout.strip()
+        except Exception:
+            return ""
+
+    def win_cim(klass, prop):
+        """取单个 WMI 属性值（第一行）。
+        注意：PowerShell 冷启动约 2 秒/次，是 Windows 下最大性能瓶颈。
+        常用字段已改用 win_reg / ctypes，本函数仅作兜底，一般不调用。"""
+        return win_ps(f"(Get-CimInstance {klass} -ErrorAction SilentlyContinue | "
+                      f"Select-Object -First 1 -ExpandProperty {prop})")
+
+    def win_reg(path, name, hive="HKLM"):
+        """读注册表值。path 如 r'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'。"""
+        if winreg is None:
+            return ""
+        try:
+            root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+            k = winreg.OpenKey(root, path)
+            v, _ = winreg.QueryValueEx(k, name)
+            winreg.CloseKey(k)
+            return str(v).strip()
+        except Exception:
+            return ""
+
+    def win_reg_values(path, hive="HKLM"):
+        """枚举一个注册表键下的所有 (名称, 值)。winreg 不可用返回 []。"""
+        if winreg is None:
+            return []
+        out = []
+        try:
+            root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+            k = winreg.OpenKey(root, path)
+            n = winreg.QueryInfoKey(k)[1]
+            for i in range(n):
+                try:
+                    nm, v, _ = winreg.EnumValue(k, i)
+                    out.append((nm, str(v).strip()))
+                except Exception:
+                    pass
+            winreg.CloseKey(k)
+        except Exception:
+            pass
+        return out
+
+    def win_reg_subkeys(path, hive="HKLM"):
+        """枚举一个注册表键下的子键名。"""
+        if winreg is None:
+            return []
+        out = []
+        try:
+            root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+            k = winreg.OpenKey(root, path)
+            n = winreg.QueryInfoKey(k)[0]
+            for i in range(n):
+                try:
+                    out.append(winreg.EnumKey(k, i))
+                except Exception:
+                    pass
+            winreg.CloseKey(k)
+        except Exception:
+            pass
+        return out
+
+    def win_cpu_name():
+        """CPU 型号：注册表（零 PS），比 WMI 快且准。"""
+        return win_reg(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                       "ProcessorNameString")
+
+    def win_gpu_names():
+        """所有显示适配器名（注册表，零 PS）。注册表能列出 WMI 看不到的真实独显。"""
+        base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        names = []
+        for sub in win_reg_subkeys(base):
+            if not sub.isdigit():
+                continue
+            d = win_reg(base + "\\" + sub, "DriverDesc")
+            if d and d.lower() not in names:
+                names.append(d.lower())
+                names[-1] = d
+        return names
+
+    def win_sysinfo():
+        """(厂商, 型号)：注册表（零 PS）。"""
+        base = r"SYSTEM\CurrentControlSet\Control\SystemInformation"
+        mfr = win_reg(base, "SystemManufacturer")
+        model = win_reg(base, "SystemProductName")
+        if not mfr or not model:
+            b = r"HARDWARE\DESCRIPTION\System\BIOS"
+            mfr = mfr or win_reg(b, "SystemManufacturer")
+            model = model or win_reg(b, "SystemProductName")
+        return mfr, model
+
+    def win_adapters():
+        """网卡列表 [(名称, 'ip/前缀长'), ...]。
+        ipconfig 解析（独立 exe ~50ms，零 PS、零 ctypes 结构风险）。
+        逐行状态机：遇 'adapter/适配器' 行更新当前网卡名，遇 IPv4 行归属当前网卡。
+        兼容中英文及中英混合输出。
+        """
+        res = []
+        try:
+            out = subprocess.run(["ipconfig"], capture_output=True, timeout=5)
+            raw = out.stdout or b""
+            text = raw.decode("utf-8", "replace")
+            if "\ufffd" in text:
+                text = raw.decode("gbk", "replace")
+            cur = ""
+            ipv4 = mask = ""
+            def flush():
+                if cur and ipv4 and ipv4 != "0.0.0.0" and not ipv4.startswith("169.254."):
+                    plen = 24
+                    if mask:
+                        try:
+                            plen = sum(bin(int(x)).count("1") for x in mask.split("."))
+                        except Exception:
+                            pass
+                    res.append((cur, f"{ipv4}/{plen}"))
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                # 网卡名行：以 ':' 结尾且含 adapter/适配器，或 'Unknown adapter'
+                if line.endswith(":") and ("adapter" in line.lower() or "适配器" in line):
+                    flush()
+                    cur = line.rstrip(":").strip()
+                    cur = re.sub(r"^(unknown|ethernet|wireless lan|无线局域网)\s+", "", cur, flags=re.I).strip()
+                    ipv4 = mask = ""
+                    continue
+                m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", raw_line)
+                if not m:
+                    continue
+                if ("IPv4" in raw_line or "地址" in raw_line) and not ipv4:
+                    ipv4 = m.group(1)
+                elif ("掩码" in raw_line or "Mask" in raw_line) and not mask:
+                    mask = m.group(1)
+            flush()
+        except Exception:
+            pass
+        return res
+
+    def win_proc_count():
+        """进程数：tasklist 数行（独立 exe ~100ms，零 PS、零 ctypes 风险）。"""
+        try:
+            out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                                 capture_output=True, timeout=6)
+            text = (out.stdout or b"").decode("utf-8", "replace")
+            n = len([l for l in text.splitlines() if l.strip().startswith('"')])
+            return n if n else None
+        except Exception:
+            return None
+
+    class _MemStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    def win_mem():
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        try:
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return st
+        except Exception:
+            return None
+
+    class _PowerStatus(ctypes.Structure):
+        # Windows SYSTEM_POWER_STATUS 里前 4 个都是 BYTE（无符号）。
+        # 用 c_byte 会把"无电池"的 255 解析成 -1。
+        _fields_ = [
+            ("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+            ("BatteryLifePercent", ctypes.c_ubyte), ("Reserved1", ctypes.c_ubyte),
+            ("BatteryLifeTime", wintypes.DWORD), ("BatteryFullLifeTime", wintypes.DWORD),
+        ]
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    def _ft_int(ft):
+        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+    def win_cpu_times():
+        """返回 (idle, total) 的 100ns 计数值；GetSystemTimes 的 kernel 已含 idle。"""
+        idle, kern, user = _FileTime(), _FileTime(), _FileTime()
+        try:
+            ok = ctypes.windll.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user))
+            if not ok:
+                return None
+            return _ft_int(idle), _ft_int(kern) + _ft_int(user)
+        except Exception:
+            return None
+
+    def win_ifaces():
+        """[(网卡名, 'ip/前缀长'), ...]。优先 ctypes（零 PS），失败退 WMI。"""
+        res = win_adapters()
+        if res:
+            return res
+        # 兜底：Get-NetIPAddress（冷启 PS ~2s，正常不会走到）
+        import csv as _csv, io as _io
+        script = ("Get-NetIPAddress -AddressFamily IPv4 | "
+                  "Where-Object {$_.IPAddress -notlike '127.*'} | "
+                  "Select-Object InterfaceAlias,IPAddress,PrefixLength | "
+                  "ConvertTo-Csv -NoTypeInformation")
+        try:
+            for row in _csv.DictReader(_io.StringIO(win_ps(script))):
+                alias = (row.get("InterfaceAlias") or "").strip()
+                ip = (row.get("IPAddress") or "").strip()
+                plen = (row.get("PrefixLength") or "").strip()
+                if alias and ip and ip != "0.0.0.0":
+                    res.append((alias, f"{ip}/{plen}"))
+        except Exception:
+            pass
+        return res
+
+    # ---- 字段实现 --------------------------------------------------------
+
+    def wf_user():
+        user = os.environ.get("USERNAME") or "?"
+        host = os.environ.get("COMPUTERNAME") or platform.node()
+        return f"{user}@{host}", None
+
+    def wf_os():
+        base = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        prod = win_reg(base, "ProductName")
+        disp = win_reg(base, "DisplayVersion")
+        build = win_reg(base, "CurrentBuild")
+        ubr = win_reg(base, "UBR")
+        name = prod
+        if build and build.isdigit() and int(build) >= 22000 and "Windows 10" in prod:
+            name = prod.replace("Windows 10", "Windows 11")
+        bits = [n for n in (name, disp) if n]
+        ver = f"{build}.{ubr}" if build and ubr else (build or "")
+        s = f"{' '.join(bits)} ({ver})" if bits else f"Windows ({platform.version()})"
+        return f"{s} ({platform.machine()})", None
+
+    def wf_kern():
+        return f"Windows NT {platform.version()}", None
+
+    def wf_host():
+        mfr, model = win_sysinfo()
+        mfr = re.sub(r"\s+", " ", mfr).strip()
+        model = re.sub(r"\s+", " ", model).strip()
+        # 精简冗长厂商名
+        for long, short in (
+            ("MICRO-STAR INTERNATIONAL CO., LTD.", "MSI"),
+            ("ASUSTeK COMPUTER INC.", "ASUS"),
+            ("Gigabyte Technology Co., Ltd.", "Gigabyte"),
+            ("Dell Inc.", "Dell"), ("HP", "HP"),
+            ("LENOVO", "Lenovo"), ("System Manufacturer", ""),
+        ):
+            mfr = mfr.replace(long, short)
+        mfr = re.sub(r"\s+", " ", mfr).strip()
+        if model and model.lower() not in ("system manufacturer", "to be filled by o.e.m.", "unknown"):
+            return f"{mfr} {model}".strip(), None
+        return os.environ.get("COMPUTERNAME", platform.node()), None
+
+    def wf_wm():
+        return "Windows Shell (DWM)", None
+
+    def wf_de():
+        return None, None
+
+    def wf_shell():
+        # 父进程名的 NtQueryInformationProcess ctypes 在某些机器上会触发访问冲突
+        # (0xC0000005)，且通过 SSH/cmd 间接启动时父进程本是 python/sshd，无意义。
+        # 直接用环境推断：WT_SESSION → Windows Terminal；否则 ComSpec（cmd.exe）。
+        if os.environ.get("WT_SESSION"):
+            return "Windows Terminal", None
+        return os.path.basename(os.environ.get("ComSpec", "")) or "cmd", None
+
+    def wf_term():
+        v, _ = f_term()
+        return (v or "Windows Console"), None
+
+    def wf_cpu():
+        name = re.sub(r"\s+", " ", win_cpu_name()).strip()
+        threads = os.cpu_count() or 0
+        # 物理核数：WMI(Win32_Processor.NumberOfCores) 要冷启 PowerShell ~2s，
+        # 这里用注册表近似：逻辑处理器数的一半（超线程 CPU）或注册表核数字段。
+        cores = 0
+        try:
+            c0 = win_reg_values(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            for nm, v in c0:
+                if nm.lower() in ("numberofcores",) and v.isdigit():
+                    cores = int(v); break
+            if not cores:
+                reg_cpus = win_reg_subkeys(r"HARDWARE\DESCRIPTION\System\CentralProcessor")
+                logical = len([c for c in reg_cpus if c.isdigit()])
+                # 有超线程时逻辑数 ≈ 2×物理核；无超线程时相等
+                cores = logical // 2 if logical and logical == threads and threads > 1 else logical
+        except Exception:
+            pass
+        if name and threads:
+            if cores and cores != threads:
+                return f"{name} ({cores}c/{threads}t)", None
+            return f"{name} ({threads}t)", None
+        return (name or platform.processor() or None), None
+
+    def wf_cpu_usage():
+        try:
+            a = win_cpu_times()
+            if not a:
+                return None, None
+            time.sleep(0.3)
+            b = win_cpu_times()
+            if not b:
+                return None, None
+            dt, di = b[1] - a[1], b[0] - a[0]
+            if dt <= 0:
+                return None, None
+            pct = max(0.0, min(100.0, (1 - di / dt) * 100))
+            return f"{pct:.0f}%", pct
+        except Exception:
+            return None, None
+
+    def wf_gpu():
+        # 注册表枚举：零 PS，且能列出 WMI 看不到的真实独显（如这台机的 GTX1060）。
+        lines = win_gpu_names()
+        if not lines:
+            return None, None
+        virtual_kw = ("basic display", "virtual display", "gameviewer", "microsoft remote",
+                      "rdp", "hyper-v", "mirror", "dummy", "sunshine", "mu mu", "mumu",
+                      "todesk", "oray", "zako")
+        real = [l for l in lines if not any(k in l.lower() for k in virtual_kw)]
+        pick = real[0] if real else lines[0]
+        pick = re.sub(r"\s+", " ", pick).strip()
+        return pick, None
+
+    def wf_mem():
+        st = win_mem()
+        if not st:
+            return None, None
+        total, avail = st.ullTotalPhys, st.ullAvailPhys
+        used = total - avail
+        pct = used / total * 100 if total else 0
+        return f"{human_bytes(used)} / {human_bytes(total)} ({pct:.0f}%)", pct
+
+    def wf_disk():
+        try:
+            u = shutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\")
+            total, used, free = u.total, u.used, u.free
+            pct = used / total * 100 if total else 0
+            return f"{human_bytes(used)} / {human_bytes(total)} ({pct:.0f}%)", pct
+        except Exception:
+            return None, None
+
+    def wf_up():
+        try:
+            up = ctypes.windll.kernel32.GetTickCount64() / 1000.0
+            h, rem = divmod(int(up), 3600)
+            m, s = divmod(rem, 60)
+            if h >= 24:
+                d, h = divmod(h, 24)
+                return f"{d}d {h}h {m}m", None
+            return f"{h}h {m}m {s}s", None
+        except Exception:
+            return None, None
+
+    def wf_pkgs():
+        n = 0
+        if winreg is not None:
+            roots = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            ]
+            for root, p in roots:
+                try:
+                    k = winreg.OpenKey(root, p)
+                    n += winreg.QueryInfoKey(k)[0]
+                    winreg.CloseKey(k)
+                except Exception:
+                    pass
+        return (f"{n} (registry)" if n else None), None
+
+    def wf_res():
+        try:
+            w = ctypes.windll.user32.GetSystemMetrics(0)
+            h = ctypes.windll.user32.GetSystemMetrics(1)
+            if w and h:
+                return f"{w}x{h}", None
+        except Exception:
+            pass
+        return None, None  # 注册表无可靠分辨率；GetSystemMetrics 已覆盖常见情况
+
+    def wf_theme():
+        v = win_reg(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "AppsUseLightTheme", "HKCU")
+        return ({"1": "Light", "0": "Dark"}.get(v)), None
+
+    def wf_rice():
+        v = win_reg(r"SOFTWARE\Microsoft\Windows\DWM", "AccentColor", "HKCU")
+        try:
+            abgr = int(v) & 0xFFFFFF
+            return f"#{abgr & 0xFF:02x}{(abgr >> 8) & 0xFF:02x}{(abgr >> 16) & 0xFF:02x}", None
+        except Exception:
+            return None, None
+
+    def wf_ip():
+        ips = [f"{iface}: {cidr}" for iface, cidr in win_ifaces()]
+        return (", ".join(ips) if ips else None), None
+
+    def wf_vpn():
+        kws = ("tun", "tap", "wg", "wireguard", "tailscale", "zerotier", "zt",
+               "easytier", "ppp", "vpn", "virtual")
+        ips = [f"{iface}: {cidr}" for iface, cidr in win_ifaces()
+               if (any(k in iface.lower() for k in kws) or
+                   iface.lower().startswith("et_") or           # EasyTier 网卡 et_xxxx
+                   ("未知适配器" in iface and cidr.startswith("10.144.")))]
+        return (", ".join(ips) if ips else None), None
+
+    def wf_wifi():
+        # 直接调 netsh.exe（独立进程 ~50ms），不经过 PowerShell（冷启 ~2s）。
+        try:
+            out = subprocess.run(["netsh", "wlan", "show", "interfaces"],
+                                 capture_output=True, timeout=4)
+            text = out.stdout.decode("utf-8", "replace") or out.stdout.decode("gbk", "replace")
+            m = re.search(r"^\s*SSID\s*:\s*(.+)$", text, re.M)
+            if m:
+                ssid = m.group(1).strip()
+                return (ssid if ssid and ssid.lower() != "<unknown>" else None), None
+        except Exception:
+            pass
+        return None, None
+
+    def wf_bat():
+        st = _PowerStatus()
+        try:
+            ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st))
+        except Exception:
+            return None, None
+        pct = st.BatteryLifePercent
+        if pct in (0, 255) or pct > 100:  # 255=无电池；防御性挡掉异常值
+            return None, None
+        ac = {0: "Discharging", 1: "AC"}.get(st.ACLineStatus, "")
+        return (f"{pct}% [{ac}]" if ac else f"{pct}%"), pct
+
+    def wf_load():
+        return None, None
+
+    def wf_procs():
+        n = win_proc_count()
+        return (str(n) if n else None), None
+
+    def wf_swap():
+        st = win_mem()
+        if not st:
+            return None, None
+        total, free = st.ullTotalPageFile, st.ullAvailPageFile
+        if not total:
+            return None, None
+        used = total - free
+        pct = used / total * 100
+        return f"{human_bytes(used)} / {human_bytes(total)} ({pct:.0f}%)", pct
+
+    _wmi_temp_cache = [None, False]  # [值, 是否已查]
+
+    def wf_temp():
+        # WMI 温度要冷启 PowerShell(~2s)，且台式机多数读不到（MSAcpi 类常不存在）。
+        # 默认跳过以保证速度；需要时设 NF_WIN_WMI_TEMP=1 开启。
+        if os.environ.get("NF_WIN_WMI_TEMP") != "1":
+            return None, None
+        if not _wmi_temp_cache[1]:
+            out = win_cim("MSAcpi_ThermalZoneTemperature", "CurrentTemperature")
+            m = re.search(r"(\d+)", out)
+            _wmi_temp_cache[0] = (int(m.group(1)) / 10.0 - 273.15) if m else None
+            _wmi_temp_cache[1] = True
+        c = _wmi_temp_cache[0]
+        if c is None:
+            return None, None
+        return f"CPU: {c:.0f}°C", None
+
+    def wf_init():
+        return None, None
+
+    def wf_locale():
+        # 用户区域：环境变量 → 注册表（零 PS），最后才退回 Get-Culture。
+        v = (os.environ.get("LANG") or os.environ.get("LC_ALL") or
+             win_reg(r"CONTROL PANEL\INTERNATIONAL", "LocaleName", "HKCU") or
+             win_reg(r"CONTROL PANEL\INTERNATIONAL", "Locale"))
+        return (v or None), None
+
+    def wf_fonts():
+        try:
+            n = len([f for f in os.listdir(r"C:\Windows\Fonts")
+                     if f.lower().endswith((".ttf", ".otf", ".ttc", ".fon"))])
+            return (f"{n} (Windows Fonts)" if n else None), None
+        except Exception:
+            return None, None
+
+    def wf_datetime():
+        return time.strftime("%Y-%m-%d %H:%M:%S %Z"), None
+
+    def wf_pubip():
+        return f_pubip()
+
+    # 字段分发表：build_lines 在 IS_WIN 时用这里的函数替换 FIELDS 里的
+    WIN_FIELDS = {
+        "user": wf_user, "os": wf_os, "kern": wf_kern, "host": wf_host,
+        "wm": wf_wm, "de": wf_de, "shell": wf_shell, "term": wf_term,
+        "cpu": wf_cpu, "cpu_usage": wf_cpu_usage, "gpu": wf_gpu,
+        "mem": wf_mem, "disk": wf_disk, "up": wf_up, "pkgs": wf_pkgs,
+        "res": wf_res, "theme": wf_theme, "rice": wf_rice,
+        "ip": wf_ip, "vpn": wf_vpn, "wifi": wf_wifi, "bat": wf_bat,
+        "load": wf_load, "procs": wf_procs, "swap": wf_swap,
+        "temp": wf_temp, "init": wf_init, "locale": wf_locale,
+        "fonts": wf_fonts, "datetime": wf_datetime, "pubip": wf_pubip,
+    }
+
+# --------------------------------------------------------------------------
 # Logo 库（ASCII）
 # --------------------------------------------------------------------------
 
@@ -230,6 +781,23 @@ LOGOS = {
         " |  \\___/  |   ",
         "  \\_______/    ",
     ],
+    # Windows 11 四格窗口（等宽字符画，配 Nerd Font 效果更好）
+    "windows": [
+        r"  ████████████████  ",
+        r"  ████████████████  ",
+        r"  ████████████████  ",
+        r"  ████████████████  ",
+        r"  ████████████████  ",
+        r"  ████████████████  ",
+        r"  ████████████████  ",
+        r"                    ",
+        r"  ██████    ██████  ",
+        r"  ██████    ██████  ",
+        r"  ██████    ██████  ",
+        r"  ██████    ██████  ",
+        r"  ██████    ██████  ",
+        r"  ██████    ██████  ",
+    ],
     "android": [
         '         -o          o-',
         '          +hydNNNNdyh+',
@@ -252,6 +820,33 @@ LOGOS = {
     ],
 }
 LOGOS["arch-full"] = LOGOS["arch"]  # 兼容旧用法：arch 现在就是原版
+
+# 经典 Windows 四色窗口 logo：字符层 + 颜色层逐格上色（空格=不上色）。
+# 每格用 5x3 的 █ 块，格间留白，四格红绿蓝黄，避免连成一整条实心色带。
+WINDOWS_COLOR_LOGO = [
+    ('        ,.=:!!t3Z3z.,               ', '        rrrrrrrrrrrrr               '),
+    ('       :tt:::tt333EE3               ', '       rrrrrrrrrrrrrr               '),
+    ('       Et:::ztt33EEEL @Ee.,      ..,', '       rrrrrrrrrrrrrr ggggg      ggg'),
+    ('      ;tt:::tt333EE7 ;EEEEEEttttt33#', '      rrrrrrrrrrrrrr ggggggggggggggg'),
+    ('     :Et:::zt333EEQ. $EEEEEttttt33QL', '     rrrrrrrrrrrrrrr ggggggggggggggg'),
+    ('     it::::tt333EEF @EEEEEEttttt33F ', '     rrrrrrrrrrrrrr ggggggggggggggg '),
+    ('    ;3=*^```"*4EEV :EEEEEEttttt33@. ', '    rrrrrrrrrrrrrr gggggggggggggggg '),
+    ('    ,.=::::!t=., ` @EEEEEEtttz33QF  ', '    bbbbbbbbbbbb r ggggggggggggggg  '),
+    ('   ;::::::::zt33)   "4EEEtttji3P*   ', '   bbbbbbbbbbbbbb   ggggggggggggg   '),
+    ('  :t::::::::tt33.:Z3z..  `` ,..g.   ', '  bbbbbbbbbbbbbbbyyyyyy  gg yyyyy   '),
+    ('  i::::::::zt33F AEEEtttt::::ztF    ', '  bbbbbbbbbbbbbb yyyyyyyyyyyyyyy    '),
+    (' ;:::::::::t33V ;EEEttttt::::t3     ', ' bbbbbbbbbbbbbb yyyyyyyyyyyyyyy     '),
+    (' E::::::::zt33L @EEEtttt::::z3F     ', ' bbbbbbbbbbbbbb yyyyyyyyyyyyyyy     '),
+    ('{3=*^```"*4E3) ;EEEtttt:::::tZ`     ', 'bbbbbbbbbbbbbb yyyyyyyyyyyyyyyy     '),
+    ('             ` :EEEEtttt::::z7      ', '             b yyyyyyyyyyyyyyy      '),
+    ('                 "VEzjt:;;z>*`      ', '                 yyyyyyyyyyyyy      '),
+]
+WINDOWS_LOGO_RGB = {
+    "r": (241, 112, 91),    # 红
+    "g": (91, 193, 110),    # 绿
+    "b": (55, 148, 232),    # 蓝
+    "y": (247, 191, 61),    # 黄
+}
 
 def image_dimensions(data):
     """从 PNG / JPEG 字节里读 (宽, 高)，零依赖。识别不了返回 None。"""
@@ -318,7 +913,9 @@ def kitty_graphics_ok():
     return False
 
 def detect_logo():
-    """按 /etc/os-release 猜一个 logo；Termux 下用 android。"""
+    """按 /etc/os-release 猜一个 logo；Termux 下用 android；Windows 用 windows。"""
+    if IS_WIN:
+        return "windows"
     if is_termux():
         return "android"
     rel = read_file("/etc/os-release").lower()
@@ -1015,6 +1612,8 @@ def label_for(key, label):
     """按环境微调标签。"""
     if key == "disk" and is_termux():
         return "Disk (~)"
+    if key == "disk" and IS_WIN:
+        return f"Disk ({os.environ.get('SystemDrive', 'C:').rstrip(':')})"
     return label
 
 def build_lines(cfg, args, pal):
@@ -1029,6 +1628,8 @@ def build_lines(cfg, args, pal):
             if key not in FIELDS:
                 continue
             label, fn = FIELDS[key]
+            if IS_WIN:
+                fn = WIN_FIELDS.get(key, lambda: (None, None))
             try:
                 val, pct = fn()
             except Exception:
@@ -1043,6 +1644,8 @@ def build_lines(cfg, args, pal):
                 if key not in FIELDS:
                     continue
                 label, fn = FIELDS[key]
+                if IS_WIN:
+                    fn = WIN_FIELDS.get(key, lambda: (None, None))
                 try:
                     val, pct = fn()
                 except Exception:
@@ -1100,7 +1703,10 @@ def render(cfg, args, pal):
                 out += shift + tt.rstrip()
             return out
 
-    logo = LOGOS.get(args.logo, []) if args.logo != "off" else []
+    # Windows logo 用四色字符层（字符+颜色成对），其余 logo 用单色字符层
+    is_color_logo = (args.logo == "windows")
+    logo_src = WINDOWS_COLOR_LOGO if is_color_logo else [(l, None) for l in LOGOS.get(args.logo, [])] if args.logo != "off" else []
+    logo = [pair[0] for pair in logo_src]
     logo_w = max((len(l) for l in logo), default=0)
 
     # 终端宽度（SSH / 管道下 get_terminal_size 会 fallback 到 80）
@@ -1138,7 +1744,9 @@ def render(cfg, args, pal):
     out_lines = []
     if position == "top" and logo:
         # 顶部布局：logo 独占上方，文字用整行宽度（省略号更少）
-        out_lines.extend(pal.logo(l.rstrip()) for l in logo)
+        for _i, _l in enumerate(logo):
+            _crow = logo_src[_i][1] if is_color_logo else None
+            out_lines.append(pal.logo_line(_l.rstrip(), _crow))
         if title_lines:
             out_lines.append("")
             out_lines.extend(indent + t for t in title_lines)
@@ -1157,7 +1765,8 @@ def render(cfg, args, pal):
         nlines = max(len(text_rows), len(logo))
         for i in range(nlines):
             if i < len(logo):
-                logo_part = pal.logo(logo[i].rstrip())
+                _crow = logo_src[i][1] if is_color_logo else None
+                logo_part = pal.logo_line(logo[i].rstrip(), _crow)
             else:
                 logo_part = " " * logo_w
             text = text_rows[i] if i < len(text_rows) else ""
@@ -1189,6 +1798,14 @@ def load_config(path):
     return cfg
 
 def main():
+    # Windows 控制台默认 GBK，输出 █ ✦ ° 等字符会抛 UnicodeEncodeError。
+    # 强制切 UTF-8；reconfigure 在 Python 3.7+ 可用，老版本忽略。
+    if IS_WIN:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     ap = argparse.ArgumentParser(description="nagisafetch — 零依赖系统信息工具")
     ap.add_argument("--version", action="version", version=f"nagisafetch {__version__}")
     ap.add_argument("-c", "--config", default="default",
@@ -1216,8 +1833,12 @@ def main():
     # 默认参数文件：~/.config/nagisafetch/default-args 里写命令行参数（shell 风格，支持引号）。
     # 前置到 argv，用户显式参数在后会覆盖。文件不存在则无影响（AstrBot/Termux 不受牵连）。
     # 兼容旧路径 ~/.config/sysfetch/default-args（老用户升级不丢配置）。
+    # Windows 额外认 %APPDATA%\nagisafetch\default-args（安装脚本写这里）
     defaults_path = None
-    for _cand in ("~/.config/nagisafetch/default-args", "~/.config/sysfetch/default-args"):
+    _cands = ["~/.config/nagisafetch/default-args", "~/.config/sysfetch/default-args"]
+    if IS_WIN and os.environ.get("APPDATA"):
+        _cands.insert(0, os.path.join(os.environ["APPDATA"], "nagisafetch", "default-args"))
+    for _cand in _cands:
         _p = Path(os.path.expanduser(_cand))
         if _p.is_file():
             defaults_path = _p
@@ -1290,6 +1911,7 @@ def main():
         pal.key = lambda s: s
         pal.group_key = lambda g, s: s
         pal.logo = lambda s: s
+        pal.logo_line = lambda s, c=None: s
         pal.sep = lambda s=": ": s
         pal.bold = pal.dim = pal.reset = ""
         pal.bar = lambda pct, width=10: f"{pct:.0f}%"
