@@ -20,7 +20,7 @@ github() {
   git init -q
   git config user.name "伊吹风子"
   git config user.email "fuko@mcpcnav.cn"
-  git add LICENSE PKGBUILD .SRCINFO README.md nagisafetch
+  git add LICENSE PKGBUILD .SRCINFO README.md nagisafetch install.sh install-cn.sh install.ps1 install-cn.ps1 publish.sh
   git commit -q -m "nagisafetch v$VER: initial release" || true
 
   echo "==> 创建 GitHub 仓库并推送"

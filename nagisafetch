@@ -189,7 +189,7 @@ def getprop(key):
     return ""
 
 # --------------------------------------------------------------------------
-# Windows 适配层：纯标准库（ctypes / winreg / PowerShell），零第三方依赖。
+# Windows 适配层：纯标准库（ctypes / winreg / 轻量系统命令），零第三方依赖、不冷启 PowerShell。
 # 每个字段一个 wf_* 函数，返回 (value, pct)，检测不到返回 (None, None)。
 # Linux / Termux 完全不进入这一层，原逻辑一行未改。
 # --------------------------------------------------------------------------
@@ -642,8 +642,9 @@ if IS_WIN:
             ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st))
         except Exception:
             return None, None
-        pct = st.BatteryLifePercent
-        if pct in (0, 255) or pct > 100:  # 255=无电池；防御性挡掉异常值
+        # BatteryFlag 的 bit 7 (0x80) = 无电池；pct=255 也是无电池标志。
+        # 注意 pct=0 是合法电量（耗尽），不能当无电池跳过。
+        if (st.BatteryFlag & 0x80) or pct == 255 or pct > 100:
             return None, None
         ac = {0: "Discharging", 1: "AC"}.get(st.ACLineStatus, "")
         return (f"{pct}% [{ac}]" if ac else f"{pct}%"), pct
