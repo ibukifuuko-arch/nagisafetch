@@ -1421,6 +1421,9 @@ def f_cpu():
         return f"{model} ({threads}t)", None
     return (model or platform.processor() or None), None
 
+# -c all 时才列出全部显卡；默认预设只取第一张，保持字段紧凑
+_GPU_SHOW_ALL = False
+
 def f_gpu():
     if not shutil.which("lspci"):
         return None, None
@@ -1428,18 +1431,29 @@ def f_gpu():
     matches = [l for l in out.splitlines() if re.search(r"vga|3d|display", l, re.I)]
     if not matches:
         return None, None
-    line = matches[0]
-    name = re.sub(r"^.*?: ", "", line).split(" (")[0]
-    # 精简冗长厂商前缀（lspci 的 vendor 全称太占宽度）
-    for long, short in (
-        ("Advanced Micro Devices, Inc. [AMD/ATI]", "AMD/ATI"),
-        ("Advanced Micro Devices, Inc. [AMD]", "AMD"),
-        ("NVIDIA Corporation", "NVIDIA"),
-        ("Intel Corporation", "Intel"),
-        ("Matrox Electronics Systems Ltd.", "Matrox"),
-    ):
-        name = name.replace(long, short)
-    return re.sub(r"\s+", " ", name).strip(), None
+
+    def _short(line):
+        name = re.sub(r"^.*?: ", "", line).split(" (")[0]
+        # 精简冗长厂商前缀（lspci 的 vendor 全称太占宽度）
+        for long, short in (
+            ("Advanced Micro Devices, Inc. [AMD/ATI]", "AMD/ATI"),
+            ("Advanced Micro Devices, Inc. [AMD]", "AMD"),
+            ("NVIDIA Corporation", "NVIDIA"),
+            ("Intel Corporation", "Intel"),
+            ("Matrox Electronics Systems Ltd.", "Matrox"),
+        ):
+            name = name.replace(long, short)
+        return re.sub(r"\s+", " ", name).strip()
+
+    if not _GPU_SHOW_ALL:
+        return _short(matches[0]), None
+    # all：一张卡常同时有 VGA/3D 两行，按名字去重保序
+    names = []
+    for line in matches:
+        n = _short(line)
+        if n and n not in names:
+            names.append(n)
+    return (" + ".join(names) if names else None), None
 
 def f_cpu_usage():
     """CPU 实时占用率：读 /proc/stat 两次取 0.3s 差。
@@ -2264,6 +2278,8 @@ def main():
         print("available fields:", ", ".join(sorted(FIELDS)))
         return
 
+    global _GPU_SHOW_ALL
+    _GPU_SHOW_ALL = (args.config == "all")
     cfg = load_config(args.config)
     # --field 覆盖：切到 classic 风格，只渲染指定字段
     if args.field:
