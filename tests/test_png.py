@@ -33,8 +33,13 @@ class PngDecoderTests(unittest.TestCase):
         self.assertEqual(decoded, (1, 1, [[(255, 32, 16, 255)]]))
 
     def test_grayscale_transparency_is_fully_transparent(self):
-        decoded = nagisafetch._png_decode(png(1, 1, 8, 0, b"\x00\x7f"))
-        self.assertEqual(decoded[2][0][0], (127, 127, 127, 255))
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+        data = b"\\x89PNG\\r\\n\\x1a\\n" + chunk(b"IHDR", ihdr)
+        data += chunk(b"tRNS", struct.pack(">H", 127))
+        data += chunk(b"IDAT", zlib.compress(b"\\x00\\x7f"))
+        data += chunk(b"IEND", b"")
+        decoded = nagisafetch._png_decode(data)
+        self.assertEqual(decoded[2][0][0], (127, 127, 127, 0))
 
     def test_rejects_bad_signature(self):
         self.assertIsNone(nagisafetch._png_decode(b"not a png"))
