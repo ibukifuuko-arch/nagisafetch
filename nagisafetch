@@ -1175,7 +1175,9 @@ def ansi_halfblock_escape(path, width=40):
     pw = max(1, min(200, int(width)))
     # 字符单元格约 1:2，故一个字符行对应 2 行像素。
     nrows = max(1, round(pw * h / w / 2))
-    nrows = min(nrows, max(1, 750_000 // pw))
+    # _img_resize 的输出上限是 50 万像素，ph = nrows * 2，故 nrows 最多 25 万 / pw。
+    # 早先这里按 75 万 / pw 算，ph 翻倍后实际到 150 万，细长图会抛 ValueError 崩掉整个程序。
+    nrows = min(nrows, max(1, 250_000 // pw))
     ph = nrows * 2
     scaled = _img_resize(w, h, rows, pw, ph)
     lines = []
@@ -2290,13 +2292,19 @@ def main():
         elif proto == "off":
             args.logo_image = None
         else:
-            if proto == "kitty":
-                seq, rows = kitty_image_escape(args.logo_image, width=args.logo_image_width)
-                cols = args.logo_image_width
-            elif proto == "ansi":
-                seq, rows, cols = ansi_halfblock_escape(args.logo_image, width=args.logo_image_width)
-            else:
-                seq, rows, cols = sixel_image_escape(args.logo_image, width=args.logo_image_width)
+            # 图片是外部输入：任何解码/编码异常都当渲染失败退回 ASCII，
+            # 不能让堆栈冒到用户面前把整个程序打崩。
+            try:
+                if proto == "kitty":
+                    seq, rows = kitty_image_escape(args.logo_image, width=args.logo_image_width)
+                    cols = args.logo_image_width
+                elif proto == "ansi":
+                    seq, rows, cols = ansi_halfblock_escape(args.logo_image, width=args.logo_image_width)
+                else:
+                    seq, rows, cols = sixel_image_escape(args.logo_image, width=args.logo_image_width)
+            except (ValueError, IndexError, OverflowError, struct.error, zlib.error) as exc:
+                print(f"logo-image: 渲染失败，退回 ASCII（{exc}）", file=sys.stderr)
+                seq, rows, cols = None, 0, 0
             if seq is None:
                 # 文件不存在 / 是 JPEG / 非 PNG：给出明确提示后退回 ASCII
                 try:

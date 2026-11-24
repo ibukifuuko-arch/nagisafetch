@@ -1,14 +1,5 @@
 # nagisafetch
 
-## 1.0.4 修复内容
-
-- 修复 Linux NetworkManager Wi-Fi 检测：只显示当前已连接的 SSID，不再把扫描到的附近热点误报为当前网络。
-- 加固 PNG 解码：校验分块边界与 CRC、IHDR 参数、透明度数据和解压长度；限制文件大小、图像尺寸及像素数量，拒绝损坏或超限图片。
-- 限制图片缩放输出尺寸，避免异常宽高比或超大目标尺寸导致内存占用失控。
-- 统一图片 Logo 的 `--logo-position left|top|auto` 布局行为，并补上 Kitty 图片布局的行高估算。
-- 增加 PNG 输入回归测试，并配置 Python 3.8、3.11、3.14 的 GitHub Actions 测试矩阵。
-
-
 查系统信息的小工具。纯 Python 标准库写的，一个依赖都不用装。Linux / Termux / Windows 三端共用同一份脚本，Windows 下自动切到原生适配层。
 
 布局这套是从 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 那儿学来的，`-c PRESET` 选预设，检测不到的字段直接跳过，不写死某个发行版或桌面环境。31 个字段、7 套主题、6 个 ASCII logo，也能贴一张 PNG 当 logo（kitty / ansi / sixel 三种图片协议）。
@@ -184,6 +175,10 @@ kitty 用于 kitty/WezTerm；Windows Terminal 和 SSH 用 ansi——它是普通
 - Windows Terminal 不支持 kitty 图片协议；图片 logo 用 `--logo-protocol ansi --logo-image xxx.png`，ansi 真彩半块是普通文本，滚动和窗口重绘都不丢图（SSH 到本机跑也一样，不要求本地有该文件）。`auto` 默认就走 ansi。Sixel 虽支持但多图层在 WT 上易崩坏，不推荐。
 - 字体建议 Nerd Font（如 JetBrainsMono NFM）。
 - 默认参数文件除了 `~\.config\nagisafetch\default-args`，也认 `%APPDATA%\nagisafetch\default-args`。
+
+## 更新
+
+1.0.4 改了几处。Wi-Fi 只显示真正连着的那个 SSID，不再把扫描到的热点当成当前网络。PNG 解码加了 CRC、尺寸和解压长度校验，坏图直接跳过，不会拖垮程序。图片 logo 现在也认 `--logo-position left|top|auto`，kitty 下行高估算也补上了。另外加了 PNG 回归测试，CI 在 3.8 / 3.11 / 3.14 上跑。
 
 ## License
 

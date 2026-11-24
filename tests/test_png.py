@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import struct
+import tempfile
 import unittest
 import zlib
 
@@ -59,6 +60,35 @@ class PngDecoderTests(unittest.TestCase):
     def test_rejects_oversized_resize_target(self):
         with self.assertRaises(ValueError):
             nagisafetch._img_resize(1, 1, [[(0, 0, 0, 255)]], 2000, 2000)
+
+
+class ImageRenderTests(unittest.TestCase):
+    """图片渲染的集成路径：极端宽高比不能把解码层的异常冒到调用方。"""
+
+    def _tall_png(self):
+        # 1x1000 细长图，曾令 ansi 路径 ph=37500、pw*ph=150 万而抛 ValueError。
+        raw = b"".join(b"\x00\xff\x00\x00\xff" for _ in range(1000))
+        data = png(1, 1000, 8, 6, raw)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)  # 3.8 兼容：不用 3.11 才有的 enterContext
+        path = pathlib.Path(tmp.name) / "tall.png"
+        path.write_bytes(data)
+        return str(path)
+
+    def test_ansi_handles_tall_image_without_crash(self):
+        path = self._tall_png()
+        seq, rows, cols = nagisafetch.ansi_halfblock_escape(path, width=40)
+        self.assertIsNotNone(seq)
+        self.assertGreater(rows, 0)
+        self.assertEqual(cols, 40)
+        self.assertLessEqual(rows * 2 * cols, 500_000)
+
+    def test_sixel_handles_tall_image_without_crash(self):
+        path = self._tall_png()
+        seq, rows, cols = nagisafetch.sixel_image_escape(path, width=40)
+        self.assertIsNotNone(seq)
+        self.assertGreater(rows, 0)
+        self.assertGreater(cols, 0)
 
 
 if __name__ == "__main__":
