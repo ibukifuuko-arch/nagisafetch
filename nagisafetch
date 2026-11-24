@@ -26,7 +26,7 @@ Themes:
   分组: sora（硬件绿·软件黄·桌面蓝·时间品红，来自 s0raLin/fastfetch-config）
 """
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 import argparse
 import base64
@@ -1946,7 +1946,13 @@ THEMES = {
     "kanagawa": (106, 198, 211),
     "rose": (233, 163, 201),
     "sora": (189, 147, 249),  # accent 取品红（time 组色），logo 跟着走
+    # CLANNAD 彩蛋：浅粉取团子外皮，暗红取发夹/豆沙（见 GROUP_THEMES）
+    "nagisa": (247, 182, 194),
+    "dango": (247, 182, 194),  # 别名，指向同一套配色
 }
+
+NAGISA_TITLE = "古河渚"
+NAGISA_SUBTITLE = "让我带你去吧，这座小镇，愿望实现的地方……"
 
 # 分组配色：硬件绿 / 软件黄 / 桌面蓝 / 时间品红（来自 s0raLin/fastfetch-config）
 # 键同时兼容 default/all 预设的组名（system/network），让 --theme sora 在任何预设下都上色
@@ -1959,6 +1965,11 @@ GROUP_THEMES = {
         "system": (249, 196, 86),     # 兼容 default/all 的 system 组 → 黄
         "network": (88, 166, 255),    # 兼容 all 的 network 组 → 蓝
     },
+    # 暗红重音：红色发夹 / 豆沙馅，盖住各预设的全部组名
+    "nagisa": {g: (198, 84, 104) for g in
+               ("hardware", "software", "desktop", "time", "system", "network")},
+    "dango": {g: (198, 84, 104) for g in
+              ("hardware", "software", "desktop", "time", "system", "network")},
 }
 
 # --------------------------------------------------------------------------
@@ -2266,6 +2277,10 @@ def main():
         args.style = cfg.get("style", "grouped")
     if args.title:
         cfg["title"] = args.title
+    # CLANNAD 彩蛋主题：只在缺 title/subtitle 时补上，用户自带配置优先
+    if args.theme in ("nagisa", "dango"):
+        cfg.setdefault("title", NAGISA_TITLE)
+        cfg.setdefault("subtitle", NAGISA_SUBTITLE)
     if args.logo is None:
         args.logo = detect_logo()
     if args.logo != "off" and args.logo not in LOGOS:
