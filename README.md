@@ -1,5 +1,11 @@
 # nagisafetch
 
+![tests](https://github.com/ibukifuuko-arch/nagisafetch/actions/workflows/tests.yml/badge.svg)
+![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![License MIT](https://img.shields.io/badge/License-MIT-yellow)
+![Zero dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)
+![Linux / Termux / Windows](https://img.shields.io/badge/Platform-Linux%20%7C%20Termux%20%7C%20Windows-4B5563)
+
 查系统信息的小工具。纯 Python 标准库写的，一个依赖都不用装。Linux / Termux / Windows 三端共用同一份脚本，Windows 下自动切到原生适配层。
 
 布局这套是从 [fastfetch](https://github.com/fastfetch-cli/fastfetch) 那儿学来的，`-c PRESET` 选预设，检测不到的字段直接跳过，不写死某个发行版或桌面环境。31 个字段、7 套主题、6 个 ASCII logo，也能贴一张 PNG 当 logo（kitty / ansi / sixel 三种图片协议）。
