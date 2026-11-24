@@ -34,9 +34,9 @@ class PngDecoderTests(unittest.TestCase):
 
     def test_grayscale_transparency_is_fully_transparent(self):
         ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
-        data = b"\\x89PNG\\r\\n\\x1a\\n" + chunk(b"IHDR", ihdr)
+        data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
         data += chunk(b"tRNS", struct.pack(">H", 127))
-        data += chunk(b"IDAT", zlib.compress(b"\\x00\\x7f"))
+        data += chunk(b"IDAT", zlib.compress(b"\x00\x7f"))
         data += chunk(b"IEND", b"")
         decoded = nagisafetch._png_decode(data)
         self.assertEqual(decoded[2][0][0], (127, 127, 127, 0))
