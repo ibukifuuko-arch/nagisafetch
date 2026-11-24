@@ -880,8 +880,8 @@ def _png_decode(data):
     """安全解码非隔行 PNG；拒绝损坏、超大或超出支持范围的输入。"""
     # 图片 logo 是外部输入：限制压缩文件、尺寸和解压后的数据量，避免内存耗尽。
     max_file = 20 * 1024 * 1024
-    max_pixels = 20_000_000
-    max_decoded = 128 * 1024 * 1024
+    max_pixels = 1_000_000
+    max_decoded = 32 * 1024 * 1024
     if not isinstance(data, (bytes, bytearray)) or len(data) < 33 or len(data) > max_file:
         return None
     if data[:8] != b"\x89PNG\r\n\x1a\n":
@@ -1041,7 +1041,7 @@ def _png_decode(data):
 
 def _img_resize(w, h, rows, tw, th):
     """区域平均缩放；拒绝异常目标尺寸，限制输出像素数量。"""
-    max_output_pixels = 1_500_000
+    max_output_pixels = 500_000
     if (w <= 0 or h <= 0 or tw <= 0 or th <= 0 or
             w > 20000 or h > 20000 or tw * th > max_output_pixels):
         raise ValueError("image dimensions exceed safety limits")
@@ -1145,8 +1145,8 @@ def sixel_image_escape(path, width=40, px_per_col=10):
     w, h, rows = dec
     pw = max(1, min(200, int(width)) * max(1, int(px_per_col)))
     ph = max(1, round(pw * h / w))
-    if pw * ph > 1_500_000:
-        scale = (1_500_000 / (pw * ph)) ** 0.5
+    if pw * ph > 500_000:
+        scale = (500_000 / (pw * ph)) ** 0.5
         pw, ph = max(1, int(pw * scale)), max(1, int(ph * scale))
     rows = _img_resize(w, h, rows, pw, ph)
     palette, idx = _img_quantize(pw, ph, rows)
@@ -1224,7 +1224,7 @@ def kitty_image_escape(path, width=40, height=None, align="left"):
         if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
             return None, 0
         iw, ih = struct.unpack(">II", header[16:24])
-        if not iw or not ih or iw > 20000 or ih > 20000 or iw * ih > 20_000_000:
+        if not iw or not ih or iw > 20000 or ih > 20000 or iw * ih > 1_000_000:
             return None, 0
     except (OSError, struct.error):
         return None, 0
