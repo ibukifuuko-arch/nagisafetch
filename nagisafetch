@@ -26,7 +26,7 @@ Themes:
   分组: sora（硬件绿·软件黄·桌面蓝·时间品红，来自 s0raLin/fastfetch-config）
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 import argparse
 import base64
@@ -877,108 +877,176 @@ WINDOWS_LOGO_RGB = {
 # --------------------------------------------------------------------------
 
 def _png_decode(data):
-    """解码 PNG 为 (w, h, pixels)，pixels=[[(r,g,b,a),...],...]。
-    支持 color type 0/2/3/4/6、bit depth 1/2/4/8/16、非隔行；失败返回 None。
-    """
+    """安全解码非隔行 PNG；拒绝损坏、超大或超出支持范围的输入。"""
+    # 图片 logo 是外部输入：限制压缩文件、尺寸和解压后的数据量，避免内存耗尽。
+    max_file = 20 * 1024 * 1024
+    max_pixels = 20_000_000
+    max_decoded = 128 * 1024 * 1024
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 33 or len(data) > max_file:
+        return None
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         return None
+
     pos, idat, plte, trns, ihdr = 8, bytearray(), None, None, None
-    while pos + 8 <= len(data):
-        ln = struct.unpack(">I", data[pos:pos + 4])[0]
-        typ = data[pos + 4:pos + 8]
-        chunk = data[pos + 8:pos + 8 + ln]
-        pos += 12 + ln
-        if typ == b"IHDR":
-            ihdr = struct.unpack(">IIBBBBB", chunk)
-        elif typ == b"PLTE":
-            plte = chunk
-        elif typ == b"tRNS":
-            trns = chunk
-        elif typ == b"IDAT":
-            idat.extend(chunk)
-        elif typ == b"IEND":
-            break
-    if not ihdr:
-        return None
-    w, h, bd, ct, comp, filt, inter = ihdr
-    if inter != 0 or bd not in (1, 2, 4, 8, 16):
-        return None
-    ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ct)
-    if ch is None or (ct == 3 and plte is None):
-        return None
-    if bd < 8 and ct not in (0, 3):
-        return None
+    seen_iend = False
     try:
-        raw = zlib.decompress(bytes(idat))
-    except zlib.error:
-        return None
-    bpix = ch * bd
-    stride = (w * bpix + 7) // 8
-    bpp = max(1, (bpix + 7) // 8)  # filter 的像素步长（字节）
-    if len(raw) < (stride + 1) * h:
-        return None
-    maxv = (1 << bd) - 1
-    rows, prev, p = [], bytearray(stride), 0
-    for _y in range(h):
-        f = raw[p]; p += 1
-        scan = bytearray(raw[p:p + stride]); p += stride
-        for i in range(stride):
-            a = scan[i - bpp] if i >= bpp else 0
-            b = prev[i]
-            c = prev[i - bpp] if i >= bpp else 0
-            if f == 1:
-                scan[i] = (scan[i] + a) & 255
-            elif f == 2:
-                scan[i] = (scan[i] + b) & 255
-            elif f == 3:
-                scan[i] = (scan[i] + ((a + b) >> 1)) & 255
-            elif f == 4:
-                pp = a + b - c
-                pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
-                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                scan[i] = (scan[i] + pr) & 255
-            elif f != 0:
+        while pos + 12 <= len(data):
+            ln = struct.unpack(">I", data[pos:pos + 4])[0]
+            typ = bytes(data[pos + 4:pos + 8])
+            end = pos + 12 + ln
+            if end > len(data):
+                return None
+            chunk = bytes(data[pos + 8:pos + 8 + ln])
+            crc = struct.unpack(">I", data[pos + 8 + ln:end])[0]
+            if (zlib.crc32(typ + chunk) & 0xffffffff) != crc:
+                return None
+            pos = end
+
+            if ihdr is None and typ != b"IHDR":
+                return None
+            if typ == b"IHDR":
+                if ihdr is not None or ln != 13:
+                    return None
+                ihdr = struct.unpack(">IIBBBBB", chunk)
+            elif typ == b"PLTE":
+                if ihdr is None or ln == 0 or ln > 768 or ln % 3:
+                    return None
+                plte = chunk
+            elif typ == b"tRNS":
+                trns = chunk
+            elif typ == b"IDAT":
+                if ihdr is None:
+                    return None
+                idat.extend(chunk)
+                if len(idat) > max_file:
+                    return None
+            elif typ == b"IEND":
+                if ln != 0:
+                    return None
+                seen_iend = True
+                break
+            elif typ and 65 <= typ[0] <= 90:
+                # 未知 critical chunk 不能安全忽略。
                 return None
 
-        def smp(x, comp):
+        if not ihdr or not seen_iend or not idat:
+            return None
+        w, h, bd, ct, comp, filt, inter = ihdr
+        if (w <= 0 or h <= 0 or w * h > max_pixels or
+                w > 20000 or h > 20000 or comp != 0 or filt != 0 or inter != 0):
+            return None
+        allowed_depths = {
+            0: (1, 2, 4, 8, 16),
+            2: (8, 16),
+            3: (1, 2, 4, 8),
+            4: (8, 16),
+            6: (8, 16),
+        }
+        if ct not in allowed_depths or bd not in allowed_depths[ct]:
+            return None
+        ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ct]
+        if ct == 3 and (plte is None or len(plte) // 3 > (1 << bd)):
+            return None
+        if ct == 0 and trns is not None and len(trns) != 2:
+            return None
+        if ct == 2 and trns is not None and len(trns) != 6:
+            return None
+        if ct == 3 and trns is not None and len(trns) > len(plte) // 3:
+            return None
+        if ct in (4, 6) and trns is not None:
+            return None
+
+        bpix = ch * bd
+        stride = (w * bpix + 7) // 8
+        expected = (stride + 1) * h
+        if expected <= 0 or expected > max_decoded:
+            return None
+        dec = zlib.decompressobj()
+        raw = dec.decompress(bytes(idat), expected + 1)
+        if len(raw) != expected or dec.unconsumed_tail or not dec.eof or dec.unused_data:
+            return None
+
+        bpp = max(1, (bpix + 7) // 8)
+        maxv = (1 << bd) - 1
+        rows, prev, p = [], bytearray(stride), 0
+
+        def sample(scan, x, component):
+            sample_index = x * ch + component
             if bd == 16:
-                return scan[(x * ch + comp) * 2]
+                return (scan[sample_index * 2] << 8) | scan[sample_index * 2 + 1]
             if bd == 8:
-                return scan[x * ch + comp]
-            bitpos = (x * ch + comp) * bd
+                return scan[sample_index]
+            bitpos = sample_index * bd
             return (scan[bitpos >> 3] >> (8 - bd - (bitpos & 7))) & maxv
 
-        row = []
-        for x in range(w):
-            if ct == 0:
-                g = smp(x, 0) * 255 // maxv
-                a = trns[1] if (trns and len(trns) >= 2 and
-                                smp(x, 0) == int.from_bytes(trns[:2], "big")) else 255
-                row.append((g, g, g, a))
-            elif ct == 2:
-                r, g, b = (smp(x, i) for i in range(3))
-                a = 0 if (trns and len(trns) >= 6 and
-                          r == int.from_bytes(trns[0:2], "big") and
-                          g == int.from_bytes(trns[2:4], "big") and
-                          b == int.from_bytes(trns[4:6], "big")) else 255
-                row.append((r, g, b, a))
-            elif ct == 3:
-                pi = smp(x, 0)
-                if pi * 3 + 2 >= len(plte):
-                    row.append((0, 0, 0, 255)); continue
-                a = trns[pi] if (trns and pi < len(trns)) else 255
-                row.append((plte[pi * 3], plte[pi * 3 + 1], plte[pi * 3 + 2], a))
-            elif ct == 4:
-                g = smp(x, 0)
-                row.append((g, g, g, smp(x, 1)))
-            elif ct == 6:
-                row.append((smp(x, 0), smp(x, 1), smp(x, 2), smp(x, 3)))
-        rows.append(row)
-        prev = scan
-    return w, h, rows
+        def to8(value):
+            return value * 255 // maxv
+
+        for _y in range(h):
+            f = raw[p]
+            p += 1
+            if f > 4:
+                return None
+            scan = bytearray(raw[p:p + stride])
+            p += stride
+            for i in range(stride):
+                a = scan[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                if f == 1:
+                    scan[i] = (scan[i] + a) & 255
+                elif f == 2:
+                    scan[i] = (scan[i] + b) & 255
+                elif f == 3:
+                    scan[i] = (scan[i] + ((a + b) >> 1)) & 255
+                elif f == 4:
+                    pp = a + b - c
+                    pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+                    predictor = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                    scan[i] = (scan[i] + predictor) & 255
+
+            row = []
+            for x in range(w):
+                if ct == 0:
+                    gray = sample(scan, x, 0)
+                    alpha = 0 if trns is not None and gray == int.from_bytes(trns, "big") else 255
+                    g = to8(gray)
+                    row.append((g, g, g, alpha))
+                elif ct == 2:
+                    r, g, b = (sample(scan, x, i) for i in range(3))
+                    transparent = (trns is not None and
+                                   (r, g, b) == tuple(int.from_bytes(trns[i:i + 2], "big")
+                                                      for i in (0, 2, 4)))
+                    row.append((to8(r), to8(g), to8(b), 0 if transparent else 255))
+                elif ct == 3:
+                    pi = sample(scan, x, 0)
+                    if pi * 3 + 2 >= len(plte):
+                        return None
+                    alpha = trns[pi] if trns is not None and pi < len(trns) else 255
+                    row.append((plte[pi * 3], plte[pi * 3 + 1],
+                                plte[pi * 3 + 2], alpha))
+                elif ct == 4:
+                    gray, alpha = sample(scan, x, 0), sample(scan, x, 1)
+                    g = to8(gray)
+                    row.append((g, g, g, to8(alpha)))
+                elif ct == 6:
+                    r, g, b, a = (sample(scan, x, i) for i in range(4))
+                    row.append((to8(r), to8(g), to8(b), to8(a)))
+            rows.append(row)
+            prev = scan
+        return w, h, rows
+    except (ValueError, IndexError, OverflowError, struct.error, zlib.error):
+        return None
+
 
 def _img_resize(w, h, rows, tw, th):
-    """区域平均缩放（alpha 加权），缩小大图到终端尺寸。"""
+    """区域平均缩放；拒绝异常目标尺寸，限制输出像素数量。"""
+    max_output_pixels = 1_500_000
+    if (w <= 0 or h <= 0 or tw <= 0 or th <= 0 or
+            w > 20000 or h > 20000 or tw * th > max_output_pixels):
+        raise ValueError("image dimensions exceed safety limits")
+    if len(rows) != h or any(len(row) != w for row in rows):
+        raise ValueError("invalid pixel buffer")
     out = []
     for ty in range(th):
         y0, y1 = ty * h // th, max(ty * h // th + 1, (ty + 1) * h // th)
@@ -989,9 +1057,12 @@ def _img_resize(w, h, rows, tw, th):
             for yy in range(y0, min(y1, h)):
                 for xx in range(x0, min(x1, w)):
                     r, g, b, a = rows[yy][xx]
-                    sr += r * a; sg += g * a; sb += b * a; sa += a
-            row.append((sr // sa, sg // sa, sb // sa, sa // ((x1 - x0) * (y1 - y0)))
-                       if sa else (0, 0, 0, 0))
+                    sr += r * a
+                    sg += g * a
+                    sb += b * a
+                    sa += a
+            row.append((sr // sa, sg // sa, sb // sa,
+                        sa // ((x1 - x0) * (y1 - y0))) if sa else (0, 0, 0, 0))
         out.append(row)
     return out
 
@@ -1072,8 +1143,11 @@ def sixel_image_escape(path, width=40, px_per_col=10):
     if dec is None:
         return None, 0, 0
     w, h, rows = dec
-    pw, ph = max(1, width * px_per_col), 0
+    pw = max(1, min(200, int(width)) * max(1, int(px_per_col)))
     ph = max(1, round(pw * h / w))
+    if pw * ph > 1_500_000:
+        scale = (1_500_000 / (pw * ph)) ** 0.5
+        pw, ph = max(1, int(pw * scale)), max(1, int(ph * scale))
     rows = _img_resize(w, h, rows, pw, ph)
     palette, idx = _img_quantize(pw, ph, rows)
     body = _sixel_encode(pw, ph, idx, palette)
@@ -1098,9 +1172,10 @@ def ansi_halfblock_escape(path, width=40):
     if dec is None:
         return None, 0, 0
     w, h, rows = dec
-    pw = max(1, int(width))
-    # 字符单元格约 1:2，故一个字符行对应 2 行像素
+    pw = max(1, min(200, int(width)))
+    # 字符单元格约 1:2，故一个字符行对应 2 行像素。
     nrows = max(1, round(pw * h / w / 2))
+    nrows = min(nrows, max(1, 750_000 // pw))
     ph = nrows * 2
     scaled = _img_resize(w, h, rows, pw, ph)
     lines = []
@@ -1143,12 +1218,24 @@ def kitty_image_escape(path, width=40, height=None, align="left"):
     p = Path(os.path.expanduser(path)).resolve()
     if not p.is_file():
         return None, 0
-    # fastfetch: "\e_Ga=T,f=100,t=f,c=%u;%s\e\\" —— base64 是路径字符串，非图片字节
+    try:
+        with p.open("rb") as fh:
+            header = fh.read(24)
+        if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+            return None, 0
+        iw, ih = struct.unpack(">II", header[16:24])
+        if not iw or not ih or iw > 20000 or ih > 20000 or iw * ih > 20_000_000:
+            return None, 0
+    except (OSError, struct.error):
+        return None, 0
+    width = max(1, min(200, int(width)))
+    # fastfetch: kitty-direct 通过文件路径让终端读取 PNG。
     b64 = base64.b64encode(str(p).encode("utf-8")).decode("ascii")
     head = f"\033_Ga=T,f=100,t=f,c={width}"
     if height:
         head += f",r={height}"
-    return head + ";" + b64 + "\033\\", 0
+    rows = max(1, round(width * ih / iw / 2))
+    return head + ";" + b64 + "\033\\", rows
 
 def kitty_graphics_ok():
     """当前终端是否支持 kitty graphics 协议（决定 --logo-image 能否显示）。
@@ -1667,12 +1754,13 @@ def f_wifi():
         # nmcli: 从 "*:SSID" 或 "SSID" 行里取当前连接的那个
         out = run(["nmcli", "-t", "-f", "IN-USE,SSID", "dev", "wifi"], timeout=3)
         for line in out.splitlines():
-            parts = line.split(":", 1)
-            if parts and parts[0].strip() == "*" and len(parts) > 1:
-                ssid = parts[1].strip()
-                break
-            elif line.strip() and not line.startswith(":"):
-                ssid = line.split(":", 1)[-1].strip()
+            # 只接受 IN-USE 列为 * 的当前连接；普通扫描结果不是已连接网络。
+            in_use, sep, name = line.partition(":")
+            if sep and in_use.strip() == "*":
+                # nmcli -t 会把 SSID 中的冒号和反斜杠转义。
+                ssid = name.replace(r"\:", ":").replace(r"\\", "\\").strip()
+                if ssid:
+                    break
     return (ssid or None), None
 
 def f_loadavg():
@@ -1920,10 +2008,7 @@ def render(cfg, args, pal):
     rows = build_lines(cfg, args, pal)
     indent = "  "
 
-    # 图片 logo：并排布局，图片在左、信息在右（fastfetch 风格）。
-    # kitty 是绘制层（不推光标）；sixel 画完光标停在图片末尾——两者都在画完后
-    # 用 \e[H 归位，再把每行文字用绝对列定位 \e[{n}G 右移到图片右侧即可，
-    # 无需 \e[6n/\e[16t 查询（SSH 下会卡）。编码结果已在 main 里缓存到 args。
+    # 图片 logo 支持 left/top/auto，与字符 logo 使用相同的布局语义。
     img_seq = getattr(args, "_img_seq", None)
     if img_seq:
         proto_used = getattr(args, "img_protocol_used", None)
@@ -1942,18 +2027,35 @@ def render(cfg, args, pal):
                 label_str = pal.group_key(cur, label) + pal.sep()
                 rendered = pal.bar(pct) if (args.bars and pct is not None) else pal.val(val)
                 text_lines.append(indent + label_str + rendered)
-        # 宽度：优先问终端真实列数；分屏/SSH 下拿到假值(<=0)时才退回估算宽度。
-        try:
-            cols = shutil.get_terminal_size(fallback=(0, 24)).columns
-        except Exception:
-            cols = 0
-        gap = 2  # 图片与文字间距，收紧到 2 列给文字多留空间
-        text_col = img_w + gap  # 文字起始列（0-based）
-        avail = (cols - text_col - 1) if cols > text_col + 8 else 10**6
 
+        try:
+            cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        except Exception:
+            cols = 80
+        gap = 2
+        text_w = max((visible_len(t) for t in text_lines), default=20)
+        position = getattr(args, "logo_position", "auto")
+        if position == "auto":
+            position = "top" if img_w + gap + text_w > cols else "left"
+
+        if position == "top":
+            if proto_used == "ansi":
+                out_lines = img_seq.split("\n")
+                if text_lines:
+                    out_lines.append("")
+                    out_lines.extend((t if args.no_trim else trim_visible(t, cols)).rstrip()
+                                     for t in text_lines)
+                return "\n".join(out_lines)
+            # kitty/sixel 在绘图层输出；按估算图片行高将文字放到图片下方。
+            img_rows = max(1, int(getattr(args, "_img_rows", 1)))
+            out = "\033[2J\033[3J\033[H" + img_seq
+            out += f"\033[{img_rows + 2};1H"
+            out += "\n".join((t if args.no_trim else trim_visible(t, cols)).rstrip()
+                             for t in text_lines)
+            return out
+
+        # left：ANSI 图片是普通文本，kitty/sixel 则由终端绘图层绘制。
         if proto_used == "ansi":
-            # ansi 真彩半块是普通文本行（带自己的颜色），逐行并排拼接即可。
-            # 不依赖绘制层、不清屏归位，滚动/重绘/SSH 都不会丢图。
             img_lines = img_seq.split("\n")
             out_lines = []
             n = max(len(img_lines), len(text_lines))
@@ -1961,22 +2063,20 @@ def render(cfg, args, pal):
                 left = img_lines[i] if i < len(img_lines) else ""
                 right = text_lines[i] if i < len(text_lines) else ""
                 if right:
-                    tt = right if (args.no_trim or avail >= 10**6) else trim_visible(right, avail)
+                    tt = right if args.no_trim else trim_visible(right, max(1, cols - img_w - gap))
                     out_lines.append(left + " " * gap + tt.rstrip())
                 else:
                     out_lines.append(left.rstrip())
             return "\n".join(out_lines)
 
-        # kitty / sixel 是绘制层：发序列后用 \e[H 归位，再绝对列定位文字。
-        shift = f"\033[{text_col + 1}G"  # 绝对列定位（不用 C，避免累加）
-        # 1) 清屏+归位左上角  2) 画图片  3) \e[H 归位（画完图光标已移动）
-        # 漏掉第 3 步，文字会从图片底部写起、撑屏滚动，把图滚出去。
+        text_col = img_w + gap
+        avail = max(1, cols - text_col - 1)
         out = "\033[2J\033[3J\033[H" + img_seq + "\033[H"
         for i, t in enumerate(text_lines):
             if i:
-                out += "\033[1G\n"  # 换行后强制回车到行首，防列累加
-            tt = t if (args.no_trim or avail >= 10**6) else trim_visible(t, avail)
-            out += shift + tt.rstrip()
+                out += "\033[1G\n"
+            tt = t if args.no_trim else trim_visible(t, avail)
+            out += f"\033[{text_col + 1}G" + tt.rstrip()
         return out
 
     # Windows logo 用四色字符层（字符+颜色成对），其余 logo 用单色字符层
@@ -2129,6 +2229,8 @@ def main():
     except Exception as e:
         print(f"default-args 读取失败，忽略: {e}", file=sys.stderr)
     args = ap.parse_args()
+    # 防止极端宽度参数令图片渲染申请过多内存。
+    args.logo_image_width = max(1, min(200, args.logo_image_width))
 
     if args.list_presets:
         print("available presets:", ", ".join(PRESETS))
@@ -2189,8 +2291,8 @@ def main():
             args.logo_image = None
         else:
             if proto == "kitty":
-                seq, _ = kitty_image_escape(args.logo_image, width=args.logo_image_width)
-                rows, cols = 0, args.logo_image_width
+                seq, rows = kitty_image_escape(args.logo_image, width=args.logo_image_width)
+                cols = args.logo_image_width
             elif proto == "ansi":
                 seq, rows, cols = ansi_halfblock_escape(args.logo_image, width=args.logo_image_width)
             else:
